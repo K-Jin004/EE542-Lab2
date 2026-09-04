@@ -100,7 +100,7 @@ bool send_fin_wait_ack(int sockfd, sockaddr_in &server_addr, uint32_t fin_seq)
 
 int main(int argc, char *argv[])
 {
-    if (argc != 4 || argc > 7)
+    if (argc < 4 || argc > 7)
     {
         std::cerr << "usage: " << argv[0]
                   << " <server_ip> <server_port> <input_file> "
