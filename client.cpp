@@ -5,18 +5,20 @@
 
 #include <cstdlib>
 #include <cstring>
+#include <fstream>
 #include <iostream>
-#include <string>
+
+const int BUFFER_SIZE = 1400;
 
 int main(int argc, char *argv[]) {
     if (argc != 4) {
-        std::cerr << "usage: " << argv[0] << " <server_ip> <server_port> <message>\n";
+        std::cerr << "usage: " << argv[0] << " <server_ip> <server_port> <input_file>\n";
         return 1;
     }
 
     const char *server_ip = argv[1];
     int server_port = std::atoi(argv[2]);
-    std::string message = argv[3];
+    const char *input_file = argv[3];
 
     int sockfd = socket(AF_INET, SOCK_DGRAM, 0);
     if (sockfd < 0) {
@@ -34,18 +36,41 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
-    ssize_t sent = sendto(sockfd, message.c_str(), message.size(), 0,
-                          reinterpret_cast<sockaddr *>(&server_addr),
-                          sizeof(server_addr));
-    if (sent < 0) {
-        perror("sendto");
+    std::ifstream in(input_file, std::ios::binary);
+    if (!in) {
+        std::cerr << "cannot open input file\n";
         close(sockfd);
         return 1;
     }
 
-    std::cout << "sent " << sent << " bytes to "
-              << server_ip << ":" << server_port << "\n";
+    char buffer[BUFFER_SIZE];
 
+    while (in) {
+        in.read(buffer, sizeof(buffer));
+        std::streamsize bytes_read = in.gcount();
+
+        if (bytes_read > 0) {
+            ssize_t sent = sendto(sockfd, buffer, bytes_read, 0,
+                                  reinterpret_cast<sockaddr *>(&server_addr),
+                                  sizeof(server_addr));
+
+            if (sent < 0) {
+                perror("sendto");
+                break;
+            }
+
+            std::cout << "sent " << sent << " bytes\n";
+        }
+    }
+
+    sendto(sockfd, nullptr, 0, 0,
+           reinterpret_cast<sockaddr *>(&server_addr),
+           sizeof(server_addr));
+
+    std::cout << "sent FIN\n";
+
+    in.close();
     close(sockfd);
+
     return 0;
 }

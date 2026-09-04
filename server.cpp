@@ -5,17 +5,22 @@
 
 #include <cstdlib>
 #include <cstring>
+#include <fstream>
 #include <iostream>
 
+const int BUFFER_SIZE = 1400;
+
 int main(int argc, char *argv[]) {
-    if (argc != 2) {
-        std::cerr << "usage: " << argv[0] << " <listen_port>\n";
+    if (argc != 3) {
+        std::cerr << "usage: " << argv[0] << " <listen_port> <output_file>";
         return 1;
     }
 
     int port = std::atoi(argv[1]);
+    const char *output_file = argv[2];
 
     int sockfd = socket(AF_INET, SOCK_DGRAM, 0);
+
     if (sockfd < 0) {
         perror("socket");
         return 1;
@@ -32,31 +37,45 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
-    std::cout << "UDP server listening on port " << port << "\n";
+    std::ofstream out(output_file, std::ios::binary);
+    if (!out) {
+        std::cerr << "cannot open output file\n";
+        close(sockfd);
+        return 1;
+    }
 
-    char buffer[2048];
+    std::cout << "server listening on port " << port << "\n";
+
+    char buffer[BUFFER_SIZE];
+
     while (true) {
         sockaddr_in client_addr{};
         socklen_t client_len = sizeof(client_addr);
 
-        ssize_t n = recvfrom(sockfd, buffer, sizeof(buffer) - 1, 0,
+        ssize_t n = recvfrom(sockfd, buffer, sizeof(buffer), 0,
                              reinterpret_cast<sockaddr *>(&client_addr),
                              &client_len);
+
         if (n < 0) {
             perror("recvfrom");
             continue;
         }
 
-        buffer[n] = '\0';
+        if (n == 0) {
+            std::cout << "received FIN, transfer done\n";
+            break;
+        }
 
-        char client_ip[INET_ADDRSTRLEN];
-        inet_ntop(AF_INET, &client_addr.sin_addr, client_ip, sizeof(client_ip));
-
-        std::cout << "received from " << client_ip << ":"
-                  << ntohs(client_addr.sin_port) << " -> "
-                  << buffer << "\n";
+        out.write(buffer, n);
+        std::cout << "received " << n << " bytes\n";
     }
 
+    out.close();
+    std::cout << "file saved\n";
+
     close(sockfd);
+
     return 0;
+
+
 }
