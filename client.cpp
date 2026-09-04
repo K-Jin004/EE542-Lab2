@@ -11,59 +11,77 @@
 
 const int CHUNK_SIZE = 1400;
 const int TIMEOUT_SEC = 0;
-const int TIMEOUT_USEC = 50000; //50 ms
+const int TIMEOUT_USEC = 50000; // 50 ms
 
-
-
-enum PacketType {
+enum PacketType
+{
     DATA = 1,
     ACK = 2,
     FIN = 3
 };
 
-struct PacketHeader {
+struct PacketHeader
+{
     uint32_t type;
     uint32_t seq;
     uint32_t length;
 };
 
-bool wait_for_ack(int sockfd, uint32_t expected_seq) {
-    PacketHeader ack{};
+bool wait_for_ack(int sockfd, uint32_t expected_seq)
+{
+    while (true)
+    {
+        PacketHeader ack{};
 
-    ssize_t n = recvfrom(sockfd, &ack, sizeof(ack), 0, nullptr, nullptr);
+        ssize_t n = recvfrom(sockfd, &ack, sizeof(ack), 0, nullptr, nullptr);
 
-    if (n < 0) {
-        std::cout << "ACK timeout\n";
-        return false;
+        if (n < 0)
+        {
+            std::cout << "ACK timeout\n";
+            return false;
+        }
+
+        if (ack.seq == expected_seq)
+        {
+            return true;
+        }
+
+        if (ack.seq < expected_seq)
+        {
+            continue;
+        }
     }
-
-    return ack.type == ACK && ack.seq == expected_seq;
 }
 
-bool send_packet_wait_ack(int sockfd, sockaddr_in &server_addr, PacketHeader &header, const char *payload) {
-    
+bool send_packet_wait_ack(int sockfd, sockaddr_in &server_addr, PacketHeader &header, const char *payload)
+{
+
     // compose packet
     char packet[sizeof(PacketHeader) + CHUNK_SIZE];
     std::memcpy(packet, &header, sizeof(PacketHeader));
 
-    if (header.length > 0) {
+    if (header.length > 0)
+    {
         std::memcpy(packet + sizeof(PacketHeader), payload, header.length);
     }
     //
     // send and wait for ack
     size_t packet_size = sizeof(PacketHeader) + header.length;
 
-    while (true) {
+    while (true)
+    {
         ssize_t sent = sendto(sockfd, packet, packet_size, 0,
                               reinterpret_cast<sockaddr *>(&server_addr),
                               sizeof(server_addr));
 
-        if (sent < 0) {
+        if (sent < 0)
+        {
             perror("sendto");
             return false;
         }
 
-        if (wait_for_ack(sockfd, header.seq)) {
+        if (wait_for_ack(sockfd, header.seq))
+        {
             return true;
         }
 
@@ -71,8 +89,10 @@ bool send_packet_wait_ack(int sockfd, sockaddr_in &server_addr, PacketHeader &he
     }
 }
 
-int main(int argc, char *argv[]) {
-    if (argc != 4) {
+int main(int argc, char *argv[])
+{
+    if (argc != 4)
+    {
         std::cerr << "usage: " << argv[0] << " <server_ip> <server_port> <input_file>\n";
         return 1;
     }
@@ -82,7 +102,8 @@ int main(int argc, char *argv[]) {
     const char *input_file = argv[3];
 
     int sockfd = socket(AF_INET, SOCK_DGRAM, 0);
-    if (sockfd < 0) {
+    if (sockfd < 0)
+    {
         perror("socket");
         return 1;
     }
@@ -92,7 +113,8 @@ int main(int argc, char *argv[]) {
     timeout.tv_sec = TIMEOUT_SEC;
     timeout.tv_usec = TIMEOUT_USEC;
 
-    if (setsockopt(sockfd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)) < 0) {
+    if (setsockopt(sockfd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)) < 0)
+    {
         perror("setsockopt");
         close(sockfd);
         return 1;
@@ -103,14 +125,16 @@ int main(int argc, char *argv[]) {
     server_addr.sin_family = AF_INET;
     server_addr.sin_port = htons(server_port);
 
-    if (inet_pton(AF_INET, server_ip, &server_addr.sin_addr) != 1) {
+    if (inet_pton(AF_INET, server_ip, &server_addr.sin_addr) != 1)
+    {
         std::cerr << "invalid server ip\n";
         close(sockfd);
         return 1;
     }
 
     std::ifstream in(input_file, std::ios::binary);
-    if (!in) {
+    if (!in)
+    {
         std::cerr << "cannot open input file\n";
         close(sockfd);
         return 1;
@@ -122,11 +146,13 @@ int main(int argc, char *argv[]) {
 
     auto start_time = std::chrono::steady_clock::now();
 
-    while(true) {
+    while (true)
+    {
         in.read(payload, CHUNK_SIZE);
         std::streamsize bytes_read = in.gcount();
 
-        if (bytes_read <= 0) {
+        if (bytes_read <= 0)
+        {
             break;
         }
 
@@ -135,7 +161,8 @@ int main(int argc, char *argv[]) {
         header.seq = seq;
         header.length = static_cast<uint32_t>(bytes_read);
 
-        if (!send_packet_wait_ack(sockfd, server_addr, header, payload)) {
+        if (!send_packet_wait_ack(sockfd, server_addr, header, payload))
+        {
             close(sockfd);
             return 1;
         }
@@ -143,11 +170,11 @@ int main(int argc, char *argv[]) {
         total_sent += bytes_read;
         seq++;
 
-        if (seq % 1000 == 0) {
+        if (seq % 1000 == 0)
+        {
             std::cout << "sent packets: " << seq
                       << ", bytes: " << total_sent << "\n";
         }
-
     }
 
     PacketHeader fin{};
@@ -155,7 +182,8 @@ int main(int argc, char *argv[]) {
     fin.seq = seq;
     fin.length = 0;
 
-    if (!send_packet_wait_ack(sockfd, server_addr, fin, nullptr)) {
+    if (!send_packet_wait_ack(sockfd, server_addr, fin, nullptr))
+    {
         close(sockfd);
         return 1;
     }

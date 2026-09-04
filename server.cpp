@@ -98,10 +98,9 @@ int main(int argc, char *argv[]) {
             char *payload = buffer + sizeof(PacketHeader);
 
             if (header.seq == expected_seq) {
+                send_ack(sockfd, client_addr, client_len, header.seq);
                 out.write(payload, header.length);
                 total_received += header.length;
-
-                send_ack(sockfd, client_addr, client_len, header.seq);
                 expected_seq++;
 
                 if (expected_seq % 1000 == 0) {
