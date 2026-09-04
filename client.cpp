@@ -11,10 +11,9 @@
 #include <vector>
 #include <deque>
 
-const int CHUNK_SIZE = 1400;
-const int TIMEOUT_SEC = 0;
-const int TIMEOUT_USEC = 50000;
-const int WINDOW_SIZE = 128;
+const int DEFAULT_CHUNK_SIZE = 1400;
+const int DEFAULT_WINDOW_SIZE = 128;
+const int DEFAULT_TIMEOUT_MS = 50;
 
 const uint64_t PRINT_INTERVAL = 10ULL * 1024 * 1024;
 
@@ -42,16 +41,16 @@ struct PacketState
 
 void send_data_packet(int sockfd, sockaddr_in &server_addr, PacketState &pkt)
 {
-    char buffer[sizeof(PacketHeader) + CHUNK_SIZE];
+    std::vector<char> buffer(sizeof(PacketHeader) + pkt.header.length);
 
-    std::memcpy(buffer, &pkt.header, sizeof(PacketHeader));
-    std::memcpy(buffer + sizeof(PacketHeader),
+    std::memcpy(buffer.data(), &pkt.header, sizeof(PacketHeader));
+    std::memcpy(buffer.data() + sizeof(PacketHeader),
                 pkt.payload.data(),
                 pkt.header.length);
 
     sendto(sockfd,
-           buffer,
-           sizeof(PacketHeader) + pkt.header.length,
+           buffer.data(),
+           buffer.size(),
            0,
            reinterpret_cast<sockaddr *>(&server_addr),
            sizeof(server_addr));
@@ -101,15 +100,40 @@ bool send_fin_wait_ack(int sockfd, sockaddr_in &server_addr, uint32_t fin_seq)
 
 int main(int argc, char *argv[])
 {
-    if (argc != 4)
+    if (argc != 4 || argc > 7)
     {
-        std::cerr << "usage: " << argv[0] << " <server_ip> <server_port> <input_file>\n";
+        std::cerr << "usage: " << argv[0]
+                  << " <server_ip> <server_port> <input_file> "
+                  << "[chunk_size] [window_size] [timeout_ms]\n";
         return 1;
     }
 
     const char *server_ip = argv[1];
     int server_port = std::atoi(argv[2]);
     const char *input_file = argv[3];
+
+    int chunk_size = DEFAULT_CHUNK_SIZE;
+    int window_size = DEFAULT_WINDOW_SIZE;
+    int timeout_ms = DEFAULT_TIMEOUT_MS;
+
+    if (argc >= 5)
+    {
+        chunk_size = std::atoi(argv[4]);
+    }
+
+    if (argc >= 6)
+    {
+        window_size = std::atoi(argv[5]);
+    }
+
+    if (argc >= 7)
+    {
+        timeout_ms = std::atoi(argv[6]);
+    }
+
+    std::cout << "chunk_size: " << chunk_size << " bytes\n";
+    std::cout << "window_size: " << window_size << " packets\n";
+    std::cout << "timeout: " << timeout_ms << " ms\n";
 
     int sockfd = socket(AF_INET, SOCK_DGRAM, 0);
     if (sockfd < 0)
@@ -120,8 +144,8 @@ int main(int argc, char *argv[])
 
     // setting time out
     timeval timeout{};
-    timeout.tv_sec = TIMEOUT_SEC;
-    timeout.tv_usec = TIMEOUT_USEC;
+    timeout.tv_sec = timeout_ms / 1000;
+    timeout.tv_usec = (timeout_ms % 1000) * 1000;
 
     if (setsockopt(sockfd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)) < 0)
     {
@@ -161,11 +185,11 @@ int main(int argc, char *argv[])
     while (!file_done || !window.empty())
     {
         // send files until window full
-        while (!file_done && window.size() < WINDOW_SIZE)
+        while (!file_done && window.size() < window_size)
         {
-            std::vector<char> payload(CHUNK_SIZE);
+            std::vector<char> payload(chunk_size);
 
-            in.read(payload.data(), CHUNK_SIZE);
+            in.read(payload.data(), chunk_size);
             std::streamsize bytes_read = in.gcount();
 
             if (bytes_read <= 0)
@@ -226,7 +250,7 @@ int main(int argc, char *argv[])
         {
             auto elapsed = std::chrono::duration_cast<std::chrono::microseconds>(now - pkt.last_sent).count();
 
-            if (!pkt.acked && elapsed > TIMEOUT_USEC)
+            if (!pkt.acked && elapsed > timeout_ms * 1000)
             {
                 send_data_packet(sockfd, server_addr, pkt);
                 pkt.last_sent = now;

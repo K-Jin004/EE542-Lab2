@@ -40,7 +40,6 @@ void send_ack(int sockfd, sockaddr_in &client_addr, socklen_t client_len, uint32
            client_len);
 }
 
-
 void print_progress(uint64_t total_received, uint64_t &next_print)
 {
     while (total_received >= next_print)
@@ -55,14 +54,28 @@ void print_progress(uint64_t total_received, uint64_t &next_print)
 
 int main(int argc, char *argv[])
 {
-    if (argc != 3)
+    if (argc < 3 || argc > 4)
     {
-        std::cerr << "usage: " << argv[0] << " <listen_port> <output_file>";
+        std::cerr << "usage: " << argv[0]
+                  << " <listen_port> <output_file> [max_chunk_size]\n";
         return 1;
     }
 
     int port = std::atoi(argv[1]);
     const char *output_file = argv[2];
+
+    int max_chunk_size = CHUNK_SIZE;
+
+    if (argc >= 4)
+    {
+        max_chunk_size = std::atoi(argv[3]);
+    }
+
+    if (max_chunk_size <= 0)
+    {
+        std::cerr << "max_chunk_size must be positive\n";
+        return 1;
+    }
 
     int sockfd = socket(AF_INET, SOCK_DGRAM, 0);
 
@@ -94,7 +107,7 @@ int main(int argc, char *argv[])
 
     std::cout << "server listening on port " << port << "\n";
 
-    char buffer[sizeof(PacketHeader) + CHUNK_SIZE];
+    std::vector<char> buffer(sizeof(PacketHeader) + max_chunk_size);
 
     uint32_t expected_seq = 0;
     uint64_t total_received = 0;
@@ -107,9 +120,9 @@ int main(int argc, char *argv[])
         sockaddr_in client_addr{};
         socklen_t client_len = sizeof(client_addr);
 
-        ssize_t n = recvfrom(sockfd, buffer, sizeof(buffer), 0,
-                             reinterpret_cast<sockaddr *>(&client_addr),
-                             &client_len);
+        ssize_t n = recvfrom(sockfd, buffer.data(), buffer.size(), 0,
+                     reinterpret_cast<sockaddr *>(&client_addr),
+                     &client_len);
 
         if (n < 0)
         {
@@ -118,11 +131,11 @@ int main(int argc, char *argv[])
         }
 
         PacketHeader header{};
-        std::memcpy(&header, buffer, sizeof(PacketHeader));
+        std::memcpy(&header, buffer.data(), sizeof(PacketHeader));
 
         if (header.type == DATA)
         {
-            char *payload = buffer + sizeof(PacketHeader);
+            char *payload = buffer.data() + sizeof(PacketHeader);
 
             send_ack(sockfd, client_addr, client_len, header.seq);
 
