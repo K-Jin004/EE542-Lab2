@@ -3,12 +3,37 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
+#include <chrono>
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <iostream>
 
-const int BUFFER_SIZE = 1400;
+const int CHUNK_SIZE = 1400;
+
+enum PacketType {
+    DATA = 1,
+    ACK = 2,
+    FIN = 3
+};
+
+struct PacketHeader {
+    uint32_t type;
+    uint32_t seq;
+    uint32_t length;
+};
+
+void send_ack(int sockfd, sockaddr_in &client_addr, socklen_t client_len, uint32_t seq) {
+    PacketHeader ack{};
+    ack.type = ACK;
+    ack.seq = seq;
+    ack.length = 0;
+
+    sendto(sockfd, &ack, sizeof(ack), 0,
+           reinterpret_cast<sockaddr *>(&client_addr),
+           client_len);
+}
+
 
 int main(int argc, char *argv[]) {
     if (argc != 3) {
@@ -46,7 +71,12 @@ int main(int argc, char *argv[]) {
 
     std::cout << "server listening on port " << port << "\n";
 
-    char buffer[BUFFER_SIZE];
+    char buffer[sizeof(PacketHeader) + CHUNK_SIZE];
+
+    uint32_t expected_seq = 0;
+    uint64_t total_received = 0;
+
+
 
     while (true) {
         sockaddr_in client_addr{};
@@ -60,20 +90,45 @@ int main(int argc, char *argv[]) {
             perror("recvfrom");
             continue;
         }
+        
+        PacketHeader header{};
+        std::memcpy(&header, buffer, sizeof(PacketHeader));
 
-        if (n == 0) {
-            std::cout << "received FIN, transfer done\n";
+        if (header.type == DATA) {
+            char *payload = buffer + sizeof(PacketHeader);
+
+            if (header.seq == expected_seq) {
+                out.write(payload, header.length);
+                total_received += header.length;
+
+                send_ack(sockfd, client_addr, client_len, header.seq);
+                expected_seq++;
+
+                if (expected_seq % 1000 == 0) {
+                    std::cout << "received packets: " << expected_seq
+                              << ", bytes: " << total_received << "\n";
+                }
+            } else if (header.seq < expected_seq) {
+                //duplicate packet
+                send_ack(sockfd, client_addr, client_len, header.seq);
+            } else {
+                // incase random behavior
+                std::cout << "out of order packet seq=" << header.seq
+                          << ", expected=" << expected_seq << "\n";
+            }
+        } else if (header.type == FIN) {
+            send_ack(sockfd, client_addr, client_len, header.seq);
+            std::cout << "received FIN\n";
             break;
         }
 
-        out.write(buffer, n);
-        std::cout << "received " << n << " bytes\n";
     }
 
     out.close();
-    std::cout << "file saved\n";
+    std::cout << "saved file: " << output_file << "\n";
 
     close(sockfd);
+    std::cout << "total received: " << total_received << " bytes\n";
 
     return 0;
 
