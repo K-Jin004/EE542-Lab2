@@ -8,10 +8,15 @@
 #include <cstring>
 #include <fstream>
 #include <iostream>
+#include <vector>
+#include <deque>
 
 const int CHUNK_SIZE = 1400;
 const int TIMEOUT_SEC = 0;
-const int TIMEOUT_USEC = 50000; // 50 ms
+const int TIMEOUT_USEC = 50000;
+const int WINDOW_SIZE = 128;
+
+const uint64_t PRINT_INTERVAL = 10ULL * 1024 * 1024;
 
 enum PacketType
 {
@@ -27,65 +32,70 @@ struct PacketHeader
     uint32_t length;
 };
 
-bool wait_for_ack(int sockfd, uint32_t expected_seq)
+struct PacketState
 {
-    while (true)
-    {
-        PacketHeader ack{};
+    PacketHeader header;
+    std::vector<char> payload;
+    bool acked;
+    std::chrono::steady_clock::time_point last_sent;
+};
 
-        ssize_t n = recvfrom(sockfd, &ack, sizeof(ack), 0, nullptr, nullptr);
+void send_data_packet(int sockfd, sockaddr_in &server_addr, PacketState &pkt)
+{
+    char buffer[sizeof(PacketHeader) + CHUNK_SIZE];
 
-        if (n < 0)
-        {
-            std::cout << "ACK timeout\n";
-            return false;
-        }
+    std::memcpy(buffer, &pkt.header, sizeof(PacketHeader));
+    std::memcpy(buffer + sizeof(PacketHeader),
+                pkt.payload.data(),
+                pkt.header.length);
 
-        if (ack.seq == expected_seq)
-        {
-            return true;
-        }
-
-        if (ack.seq < expected_seq)
-        {
-            continue;
-        }
-    }
+    sendto(sockfd,
+           buffer,
+           sizeof(PacketHeader) + pkt.header.length,
+           0,
+           reinterpret_cast<sockaddr *>(&server_addr),
+           sizeof(server_addr));
 }
 
-bool send_packet_wait_ack(int sockfd, sockaddr_in &server_addr, PacketHeader &header, const char *payload)
+bool send_fin_wait_ack(int sockfd, sockaddr_in &server_addr, uint32_t fin_seq)
 {
-
-    // compose packet
-    char packet[sizeof(PacketHeader) + CHUNK_SIZE];
-    std::memcpy(packet, &header, sizeof(PacketHeader));
-
-    if (header.length > 0)
-    {
-        std::memcpy(packet + sizeof(PacketHeader), payload, header.length);
-    }
-    //
-    // send and wait for ack
-    size_t packet_size = sizeof(PacketHeader) + header.length;
+    PacketHeader fin{};
+    fin.type = FIN;
+    fin.seq = fin_seq;
+    fin.length = 0;
 
     while (true)
     {
-        ssize_t sent = sendto(sockfd, packet, packet_size, 0,
+        ssize_t sent = sendto(sockfd,
+                              &fin,
+                              sizeof(fin),
+                              0,
                               reinterpret_cast<sockaddr *>(&server_addr),
                               sizeof(server_addr));
 
         if (sent < 0)
         {
-            perror("sendto");
+            perror("sendto FIN");
             return false;
         }
 
-        if (wait_for_ack(sockfd, header.seq))
+        PacketHeader ack{};
+        ssize_t n = recvfrom(sockfd,
+                             &ack,
+                             sizeof(ack),
+                             0,
+                             nullptr,
+                             nullptr);
+
+        if (n >= static_cast<ssize_t>(sizeof(PacketHeader)) &&
+            ack.type == ACK &&
+            ack.seq == fin_seq)
         {
+            std::cout << "FIN acknowledged\n";
             return true;
         }
 
-        std::cout << "resend seq=" << header.seq << "\n";
+        std::cout << "timeout or wrong ACK, resend FIN\n";
     }
 }
 
@@ -140,49 +150,91 @@ int main(int argc, char *argv[])
         return 1;
     }
 
-    char payload[CHUNK_SIZE];
-    uint32_t seq = 0;
+    std::deque<PacketState> window;
+    uint32_t next_seq = 0;
     uint64_t total_sent = 0;
+    bool file_done = false;
+    uint64_t next_print = PRINT_INTERVAL;
 
     auto start_time = std::chrono::steady_clock::now();
 
-    while (true)
+    while (!file_done || !window.empty())
     {
-        in.read(payload, CHUNK_SIZE);
-        std::streamsize bytes_read = in.gcount();
-
-        if (bytes_read <= 0)
+        // send files until window full
+        while (!file_done && window.size() < WINDOW_SIZE)
         {
-            break;
+            std::vector<char> payload(CHUNK_SIZE);
+
+            in.read(payload.data(), CHUNK_SIZE);
+            std::streamsize bytes_read = in.gcount();
+
+            if (bytes_read <= 0)
+            {
+                file_done = true;
+                break;
+            }
+
+            payload.resize(bytes_read);
+
+            PacketHeader header{};
+            header.type = DATA;
+            header.seq = next_seq;
+            header.length = bytes_read;
+
+            PacketState pkt{};
+            pkt.header = header;
+            pkt.payload = payload;
+            pkt.acked = false;
+
+            send_data_packet(sockfd, server_addr, pkt);
+            pkt.last_sent = std::chrono::steady_clock::now();
+
+            window.push_back(pkt);
+            total_sent += bytes_read;
+            if (total_sent >= next_print)
+            {
+                std::cout << "sent " << (total_sent / (1024 * 1024)) << " MB\n";
+                next_print += PRINT_INTERVAL;
+            }
+
+            next_seq++;
         }
 
-        PacketHeader header{};
-        header.type = DATA;
-        header.seq = seq;
-        header.length = static_cast<uint32_t>(bytes_read);
+        PacketHeader ack{};
+        ssize_t n = recvfrom(sockfd, &ack, sizeof(ack), 0, nullptr, nullptr);
 
-        if (!send_packet_wait_ack(sockfd, server_addr, header, payload))
+        if (ack.type == ACK)
         {
-            close(sockfd);
-            return 1;
+            for (auto &pkt : window)
+            {
+                if (pkt.header.seq == ack.seq)
+                {
+                    pkt.acked = true;
+                    break;
+                }
+            }
         }
 
-        total_sent += bytes_read;
-        seq++;
-
-        if (seq % 1000 == 0)
+        while (!window.empty() && window.front().acked)
         {
-            std::cout << "sent packets: " << seq
-                      << ", bytes: " << total_sent << "\n";
+            window.pop_front();
+        }
+
+        // resend
+        auto now = std::chrono::steady_clock::now();
+        for (auto &pkt : window)
+        {
+            auto elapsed = std::chrono::duration_cast<std::chrono::microseconds>(now - pkt.last_sent).count();
+
+            if (!pkt.acked && elapsed > TIMEOUT_USEC)
+            {
+                send_data_packet(sockfd, server_addr, pkt);
+                pkt.last_sent = now;
+            }
         }
     }
 
-    PacketHeader fin{};
-    fin.type = FIN;
-    fin.seq = seq;
-    fin.length = 0;
-
-    if (!send_packet_wait_ack(sockfd, server_addr, fin, nullptr))
+    if (!send_fin_wait_ack(sockfd, server_addr, next_seq))
     {
         close(sockfd);
         return 1;

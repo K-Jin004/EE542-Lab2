@@ -8,22 +8,28 @@
 #include <cstring>
 #include <fstream>
 #include <iostream>
+#include <map>
+#include <vector>
 
 const int CHUNK_SIZE = 1400;
+const uint64_t PRINT_INTERVAL = 10ULL * 1024 * 1024;
 
-enum PacketType {
+enum PacketType
+{
     DATA = 1,
     ACK = 2,
     FIN = 3
 };
 
-struct PacketHeader {
+struct PacketHeader
+{
     uint32_t type;
     uint32_t seq;
     uint32_t length;
 };
 
-void send_ack(int sockfd, sockaddr_in &client_addr, socklen_t client_len, uint32_t seq) {
+void send_ack(int sockfd, sockaddr_in &client_addr, socklen_t client_len, uint32_t seq)
+{
     PacketHeader ack{};
     ack.type = ACK;
     ack.seq = seq;
@@ -35,8 +41,22 @@ void send_ack(int sockfd, sockaddr_in &client_addr, socklen_t client_len, uint32
 }
 
 
-int main(int argc, char *argv[]) {
-    if (argc != 3) {
+void print_progress(uint64_t total_received, uint64_t &next_print)
+{
+    while (total_received >= next_print)
+    {
+        std::cout << "received "
+                  << (next_print / (1024 * 1024))
+                  << " MB\n";
+
+        next_print += PRINT_INTERVAL;
+    }
+}
+
+int main(int argc, char *argv[])
+{
+    if (argc != 3)
+    {
         std::cerr << "usage: " << argv[0] << " <listen_port> <output_file>";
         return 1;
     }
@@ -46,7 +66,8 @@ int main(int argc, char *argv[]) {
 
     int sockfd = socket(AF_INET, SOCK_DGRAM, 0);
 
-    if (sockfd < 0) {
+    if (sockfd < 0)
+    {
         perror("socket");
         return 1;
     }
@@ -56,14 +77,16 @@ int main(int argc, char *argv[]) {
     server_addr.sin_addr.s_addr = INADDR_ANY;
     server_addr.sin_port = htons(port);
 
-    if (bind(sockfd, reinterpret_cast<sockaddr *>(&server_addr), sizeof(server_addr)) < 0) {
+    if (bind(sockfd, reinterpret_cast<sockaddr *>(&server_addr), sizeof(server_addr)) < 0)
+    {
         perror("bind");
         close(sockfd);
         return 1;
     }
 
     std::ofstream out(output_file, std::ios::binary);
-    if (!out) {
+    if (!out)
+    {
         std::cerr << "cannot open output file\n";
         close(sockfd);
         return 1;
@@ -75,10 +98,12 @@ int main(int argc, char *argv[]) {
 
     uint32_t expected_seq = 0;
     uint64_t total_received = 0;
+    uint64_t next_print = PRINT_INTERVAL;
 
+    std::map<uint32_t, std::vector<char>> pending;
 
-
-    while (true) {
+    while (true)
+    {
         sockaddr_in client_addr{};
         socklen_t client_len = sizeof(client_addr);
 
@@ -86,41 +111,58 @@ int main(int argc, char *argv[]) {
                              reinterpret_cast<sockaddr *>(&client_addr),
                              &client_len);
 
-        if (n < 0) {
+        if (n < 0)
+        {
             perror("recvfrom");
             continue;
         }
-        
+
         PacketHeader header{};
         std::memcpy(&header, buffer, sizeof(PacketHeader));
 
-        if (header.type == DATA) {
+        if (header.type == DATA)
+        {
             char *payload = buffer + sizeof(PacketHeader);
 
-            if (header.seq == expected_seq) {
-                send_ack(sockfd, client_addr, client_len, header.seq);
+            send_ack(sockfd, client_addr, client_len, header.seq);
+
+            if (header.seq < expected_seq)
+            {
+                continue;
+            }
+
+            if (header.seq == expected_seq)
+            {
                 out.write(payload, header.length);
                 total_received += header.length;
+                print_progress(total_received, next_print);
                 expected_seq++;
 
-                if (expected_seq % 1000 == 0) {
-                    std::cout << "received packets: " << expected_seq
-                              << ", bytes: " << total_received << "\n";
+                while (pending.count(expected_seq))
+                {
+                    auto &data = pending[expected_seq];
+                    out.write(data.data(), data.size());
+                    total_received += data.size();
+                    print_progress(total_received, next_print);
+                    pending.erase(expected_seq);
+                    expected_seq++;
                 }
-            } else if (header.seq < expected_seq) {
-                //duplicate packet
-                send_ack(sockfd, client_addr, client_len, header.seq);
-            } else {
-                // incase random behavior
-                std::cout << "out of order packet seq=" << header.seq
-                          << ", expected=" << expected_seq << "\n";
             }
-        } else if (header.type == FIN) {
+            else
+            {
+                if (!pending.count(header.seq))
+                {
+                    pending[header.seq] =
+                        std::vector<char>(payload, payload + header.length);
+                }
+            }
+        }
+        else if (header.type == FIN)
+        {
             send_ack(sockfd, client_addr, client_len, header.seq);
             std::cout << "received FIN\n";
             break;
         }
-
     }
 
     out.close();
@@ -130,6 +172,4 @@ int main(int argc, char *argv[]) {
     std::cout << "total received: " << total_received << " bytes\n";
 
     return 0;
-
-
 }
