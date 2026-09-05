@@ -78,23 +78,39 @@ bool send_fin_wait_ack(int sockfd, sockaddr_in &server_addr, uint32_t fin_seq)
             return false;
         }
 
-        PacketHeader ack{};
-        ssize_t n = recvfrom(sockfd,
-                             &ack,
-                             sizeof(ack),
-                             0,
-                             nullptr,
-                             nullptr);
-
-        if (n >= static_cast<ssize_t>(sizeof(PacketHeader)) &&
-            ack.type == ACK &&
-            ack.seq == fin_seq)
+        while (true)
         {
-            std::cout << "FIN acknowledged\n";
-            return true;
-        }
+            PacketHeader ack{};
+            ssize_t n = recvfrom(sockfd,
+                                 &ack,
+                                 sizeof(ack),
+                                 0,
+                                 nullptr,
+                                 nullptr);
 
-        std::cout << "timeout or wrong ACK, resend FIN\n";
+            if (n < 0)
+            {
+                std::cout << "FIN ACK timeout, resend FIN\n";
+                break;
+            }
+
+            if (n < static_cast<ssize_t>(sizeof(PacketHeader)))
+            {
+                continue;
+            }
+
+            if (ack.type != ACK)
+            {
+                continue;
+            }
+
+            if (ack.seq == fin_seq)
+            {
+                std::cout << "FIN acknowledged\n";
+                return true;
+            }       
+            // Old ACK from previous DATA packets. Ignore it and keep waiting.
+        }
     }
 }
 
