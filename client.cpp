@@ -56,7 +56,7 @@ void send_data_packet(int sockfd, sockaddr_in &server_addr, PacketState &pkt)
            sizeof(server_addr));
 }
 
-bool send_fin_wait_ack(int sockfd, sockaddr_in &server_addr, uint32_t fin_seq)
+bool send_fin_wait_ack(int sockfd, sockaddr_in &server_addr, uint32_t fin_seq, uint64_t &fin_sent)
 {
     PacketHeader fin{};
     fin.type = FIN;
@@ -77,6 +77,8 @@ bool send_fin_wait_ack(int sockfd, sockaddr_in &server_addr, uint32_t fin_seq)
             perror("sendto FIN");
             return false;
         }
+
+        fin_sent++;
 
         while (true)
         {
@@ -196,6 +198,14 @@ int main(int argc, char *argv[])
     bool file_done = false;
     uint64_t next_print = PRINT_INTERVAL;
 
+    //———— Statistics
+    uint64_t data_packet_sent = 0;     // 第一次发送 DATA 的数量
+    uint64_t data_packet_resent = 0;   // 重发 DATA 的数量
+    uint64_t ack_received = 0;         // 收到 ACK 的数量
+    uint64_t timeout_count = 0;        // timeout 导致重发的次数
+    uint64_t fin_sent = 0;             // FIN 发送次数
+    //---
+
     auto start_time = std::chrono::steady_clock::now();
 
     while (!file_done || !window.empty())
@@ -228,6 +238,7 @@ int main(int argc, char *argv[])
 
             send_data_packet(sockfd, server_addr, pkt);
             pkt.last_sent = std::chrono::steady_clock::now();
+            data_packet_sent++;
 
             window.push_back(pkt);
             total_sent += bytes_read;
@@ -243,8 +254,10 @@ int main(int argc, char *argv[])
         PacketHeader ack{};
         ssize_t n = recvfrom(sockfd, &ack, sizeof(ack), 0, nullptr, nullptr);
 
-        if (ack.type == ACK)
+        if (n >= static_cast<ssize_t>(sizeof(PacketHeader)) && ack.type == ACK)
         {
+            ack_received++;
+
             for (auto &pkt : window)
             {
                 if (pkt.header.seq == ack.seq)
@@ -270,11 +283,13 @@ int main(int argc, char *argv[])
             {
                 send_data_packet(sockfd, server_addr, pkt);
                 pkt.last_sent = now;
+                data_packet_resent++;
+                timeout_count++;
             }
         }
     }
 
-    if (!send_fin_wait_ack(sockfd, server_addr, next_seq))
+    if (!send_fin_wait_ack(sockfd, server_addr, next_seq, fin_sent))
     {
         close(sockfd);
         return 1;
@@ -291,6 +306,12 @@ int main(int argc, char *argv[])
     std::cout << "total sent: " << total_sent << " bytes\n";
     std::cout << "time: " << seconds << " sec\n";
     std::cout << "rate: " << mbps << " Mbits/sec\n";
+
+    std::cout << "data packets sent: " << data_packet_sent << "\n";
+    std::cout << "data packets resent: " << data_packet_resent << "\n";
+    std::cout << "acks received: " << ack_received << "\n";
+    std::cout << "timeouts: " << timeout_count << "\n";
+    std::cout << "FIN packets sent: " << fin_sent << "\n";
 
     return 0;
 }

@@ -113,6 +113,15 @@ int main(int argc, char *argv[])
     uint64_t total_received = 0;
     uint64_t next_print = PRINT_INTERVAL;
 
+    // ---- statistics
+    uint64_t data_packet_received = 0;      // 收到 DATA 包总数，包括重复
+    uint64_t data_packet_written = 0;       // 真正写入文件的 DATA 包数
+    uint64_t duplicate_packet_received = 0; // seq < expected_seq
+    uint64_t out_of_order_received = 0;     // seq > expected_seq
+    uint64_t ack_sent = 0;
+    uint64_t fin_received = 0;
+    // ----
+
     std::map<uint32_t, std::vector<char>> pending;
 
     while (true)
@@ -138,9 +147,11 @@ int main(int argc, char *argv[])
             char *payload = buffer.data() + sizeof(PacketHeader);
 
             send_ack(sockfd, client_addr, client_len, header.seq);
+            ack_sent++;
 
             if (header.seq < expected_seq)
             {
+                duplicate_packet_received++;
                 continue;
             }
 
@@ -148,6 +159,7 @@ int main(int argc, char *argv[])
             {
                 out.write(payload, header.length);
                 total_received += header.length;
+                data_packet_written++;
                 print_progress(total_received, next_print);
                 expected_seq++;
 
@@ -156,22 +168,21 @@ int main(int argc, char *argv[])
                     auto &data = pending[expected_seq];
                     out.write(data.data(), data.size());
                     total_received += data.size();
+                    data_packet_written++;
                     print_progress(total_received, next_print);
                     pending.erase(expected_seq);
                     expected_seq++;
                 }
-            }
-            else
-            {
+            } else {
+                out_of_order_received++;
                 if (!pending.count(header.seq))
                 {
                     pending[header.seq] =
                         std::vector<char>(payload, payload + header.length);
                 }
             }
-        }
-        else if (header.type == FIN)
-        {
+        } else if (header.type == FIN) {
+            fin_received++;
             send_ack(sockfd, client_addr, client_len, header.seq);
             std::cout << "received FIN\n";
 
@@ -185,7 +196,7 @@ int main(int argc, char *argv[])
                 sockaddr_in repeat_client{};
                 socklen_t repeat_len = sizeof(repeat_client);
 
-                ssize_t n = recvfrom(sockfd, buffer.data(), sizeof(buffer), 0,
+                ssize_t n = recvfrom(sockfd, buffer.data(), buffer.size(), 0,
                                      reinterpret_cast<sockaddr *>(&repeat_client),
                                      &repeat_len);
 
@@ -218,6 +229,14 @@ int main(int argc, char *argv[])
 
     close(sockfd);
     std::cout << "total received: " << total_received << " bytes\n";
+
+    std::cout << "data packets received: " << data_packet_received << "\n";
+    std::cout << "data packets written: " << data_packet_written << "\n";
+    std::cout << "duplicate packets received: " << duplicate_packet_received << "\n";
+    std::cout << "out-of-order packets received: " << out_of_order_received << "\n";
+    std::cout << "ACK packets sent: " << ack_sent << "\n";
+    std::cout << "FIN packets received: " << fin_received << "\n";
+    std::cout << "pending packets left: " << pending.size() << "\n";
 
     return 0;
 }
