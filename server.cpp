@@ -121,8 +121,8 @@ int main(int argc, char *argv[])
         socklen_t client_len = sizeof(client_addr);
 
         ssize_t n = recvfrom(sockfd, buffer.data(), buffer.size(), 0,
-                     reinterpret_cast<sockaddr *>(&client_addr),
-                     &client_len);
+                             reinterpret_cast<sockaddr *>(&client_addr),
+                             &client_len);
 
         if (n < 0)
         {
@@ -174,6 +174,41 @@ int main(int argc, char *argv[])
         {
             send_ack(sockfd, client_addr, client_len, header.seq);
             std::cout << "received FIN\n";
+
+            timeval timeout{};
+            timeout.tv_sec = 2;
+            timeout.tv_usec = 0;
+            setsockopt(sockfd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+
+            while (true)
+            {
+                sockaddr_in repeat_client{};
+                socklen_t repeat_len = sizeof(repeat_client);
+
+                ssize_t n = recvfrom(sockfd, buffer.data(), sizeof(buffer), 0,
+                                     reinterpret_cast<sockaddr *>(&repeat_client),
+                                     &repeat_len);
+
+                if (n < 0)
+                {
+                    break; // 2 seconds passed, no more duplicate FIN
+                }
+
+                if (n < static_cast<ssize_t>(sizeof(PacketHeader)))
+                {
+                    continue;
+                }
+
+                PacketHeader repeat_header{};
+                std::memcpy(&repeat_header, buffer.data(), sizeof(PacketHeader));
+
+                if (repeat_header.type == FIN && repeat_header.seq == header.seq)
+                {
+                    send_ack(sockfd, repeat_client, repeat_len, repeat_header.seq);
+                    std::cout << "re-ACK duplicate FIN\n";
+                }
+            }
+
             break;
         }
     }
