@@ -190,12 +190,14 @@ int main(int argc, char *argv[])
     bool file_done = false;
     uint64_t next_print = PRINT_INTERVAL;
 
-    //———— Statistics
-    uint64_t data_packet_sent = 0;     // 第一次发送 DATA 的数量
-    uint64_t data_packet_resent = 0;   // 重发 DATA 的数量
-    uint64_t ack_received = 0;         // 收到 ACK 的数量
-    uint64_t timeout_count = 0;        // timeout 导致重发的次数
-    uint64_t fin_sent = 0;             // FIN 发送次数
+    // ———— Statistics
+    uint64_t data_packet_sent = 0;   // 第一次发送 DATA 的数量
+    uint64_t data_packet_resent = 0; // 重发 DATA 的数量
+    uint64_t ack_received = 0;       // 收到 ACK 的数量
+    uint64_t timeout_count = 0;      // timeout 导致重发的次数
+    uint64_t fin_sent = 0;           // FIN 发送次数
+
+    static int pkt_count = 0;
     //---
 
     auto start_time = std::chrono::steady_clock::now();
@@ -203,7 +205,7 @@ int main(int argc, char *argv[])
     while (!file_done || !window.empty())
     {
         // send files until window full
-        while (!file_done && window.size() < window_size)
+        while (!file_done && window.size() < static_cast<size_t>(window_size))
         {
             std::vector<char> payload(chunk_size);
 
