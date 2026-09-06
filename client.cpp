@@ -2,6 +2,7 @@
 #include <netinet/in.h>
 #include <sys/socket.h>
 #include <unistd.h>
+#include <fcntl.h>
 
 #include <chrono>
 #include <cstdlib>
@@ -161,16 +162,28 @@ int main(int argc, char *argv[])
     }
 
     // setting time out
+
+    /*
     timeval timeout{};
     timeout.tv_sec = timeout_ms / 1000;
     timeout.tv_usec = (timeout_ms % 1000) * 1000;
-
     if (setsockopt(sockfd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)) < 0)
     {
         perror("setsockopt");
         close(sockfd);
         return 1;
     }
+    */
+
+    // 替换为：设置为非阻塞模式 nonblocking
+    int flags = fcntl(sockfd, F_GETFL, 0);
+    if (fcntl(sockfd, F_SETFL, flags | O_NONBLOCK) < 0)
+    {
+        perror("fcntl O_NONBLOCK");
+        close(sockfd);
+        return 1;
+    }
+
     //
 
     sockaddr_in server_addr{};
