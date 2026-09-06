@@ -66,53 +66,32 @@ bool send_fin_wait_ack(int sockfd, sockaddr_in &server_addr, uint32_t fin_seq, u
 
     while (true)
     {
-        ssize_t sent = sendto(sockfd,
-                              &fin,
-                              sizeof(fin),
-                              0,
-                              reinterpret_cast<sockaddr *>(&server_addr),
-                              sizeof(server_addr));
-
-        if (sent < 0)
-        {
-            perror("sendto FIN");
-            return false;
-        }
-
+        // 发送 FIN
+        sendto(sockfd, &fin, sizeof(fin), 0, reinterpret_cast<sockaddr *>(&server_addr), sizeof(server_addr));
         fin_sent++;
 
+        auto start = std::chrono::steady_clock::now();
         while (true)
         {
             PacketHeader ack{};
-            ssize_t n = recvfrom(sockfd,
-                                 &ack,
-                                 sizeof(ack),
-                                 0,
-                                 nullptr,
-                                 nullptr);
+            ssize_t n = recvfrom(sockfd, &ack, sizeof(ack), 0, nullptr, nullptr);
 
-            if (n < 0)
-            {
-                std::cout << "FIN ACK timeout, resend FIN\n";
-                break;
-            }
-
-            if (n < static_cast<ssize_t>(sizeof(PacketHeader)))
-            {
-                continue;
-            }
-
-            if (ack.type != ACK)
-            {
-                continue;
-            }
-
-            if (ack.seq == fin_seq)
+            if (n >= static_cast<ssize_t>(sizeof(PacketHeader)) && ack.type == ACK && ack.seq == fin_seq)
             {
                 std::cout << "FIN acknowledged\n";
                 return true;
-            }       
-            // Old ACK from previous DATA packets. Ignore it and keep waiting.
+            }
+
+            // 检查是否等待满 300ms 超时
+            auto now = std::chrono::steady_clock::now();
+            auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - start).count();
+            if (elapsed > 300)
+            {
+                std::cout << "FIN ACK timeout, resend FIN\n";
+                break; // 超时，跳出内层循环重新 sendto
+            }
+
+            usleep(1000); // 1ms 休眠，防止 CPU 空转占满
         }
     }
 }
