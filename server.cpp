@@ -105,6 +105,16 @@ int main(int argc, char *argv[])
         return 1;
     }
 
+    int buf_size = 4 * 1024 * 1024; // 4MB
+    if (setsockopt(sockfd, SOL_SOCKET, SO_RCVBUF, &buf_size, sizeof(buf_size)) < 0)
+    {
+        perror("setsockopt SO_RCVBUF");
+    }
+    if (setsockopt(sockfd, SOL_SOCKET, SO_SNDBUF, &buf_size, sizeof(buf_size)) < 0)
+    {
+        perror("setsockopt SO_SNDBUF");
+    }
+
     std::cout << "server listening on port " << port << "\n";
 
     std::vector<char> buffer(sizeof(PacketHeader) + max_chunk_size);
@@ -144,9 +154,11 @@ int main(int argc, char *argv[])
 
         if (header.type == DATA)
         {
+            data_packet_received++;
             char *payload = buffer.data() + sizeof(PacketHeader);
 
             send_ack(sockfd, client_addr, client_len, header.seq);
+            
             ack_sent++;
 
             if (header.seq < expected_seq)
@@ -173,7 +185,9 @@ int main(int argc, char *argv[])
                     pending.erase(expected_seq);
                     expected_seq++;
                 }
-            } else {
+            }
+            else
+            {
                 out_of_order_received++;
                 if (!pending.count(header.seq))
                 {
@@ -181,7 +195,9 @@ int main(int argc, char *argv[])
                         std::vector<char>(payload, payload + header.length);
                 }
             }
-        } else if (header.type == FIN) {
+        }
+        else if (header.type == FIN)
+        {
             fin_received++;
             send_ack(sockfd, client_addr, client_len, header.seq);
             std::cout << "received FIN\n";
