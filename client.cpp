@@ -331,6 +331,35 @@ int main(int argc, char *argv[])
                 pkt.last_sent = now;
                 data_packet_resent++;
                 timeout_count++;
+
+                usleep(100);
+            }
+        }
+        */
+        if (!window.empty())
+        {
+            auto now = std::chrono::steady_clock::now();
+            for (auto &pkt : window)
+            {
+                if (pkt.acked)
+                    continue;
+
+                auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                      now - pkt.last_sent)
+                                      .count();
+
+                if (elapsed_ms > timeout_ms)
+                {
+                    send_data_packet(sockfd, server_addr, pkt);
+                    pkt.last_sent = now;
+                    data_packet_resent++;
+                    timeout_count++;
+                }
+                else if (elapsed_ms < timeout_ms / 2)
+                {
+                    // 后续数据包刚发送不久，不可能超时，直接提前终止遍历
+                    break;
+                }
             }
         }
     }
