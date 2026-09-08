@@ -13,6 +13,7 @@
 
 const int CHUNK_SIZE = 1400;
 const uint64_t PRINT_INTERVAL = 10ULL * 1024 * 1024;
+const size_t RING_SIZE = 8192;
 
 enum PacketType
 {
@@ -27,6 +28,13 @@ struct PacketHeader
     uint32_t seq;      // cumulative ack. meaning all packets before seq are received
     uint32_t sack_seq; // selective ack
     uint32_t length;
+};
+
+struct PendingPacket {
+    bool valid = false;
+    uint32_t length = 0;
+    uint32_t seq;
+    char payload[CHUNK_SIZE];
 };
 
 void send_ack(int sockfd, sockaddr_in &client_addr, socklen_t client_len, uint32_t cum_ack, uint32_t sack_seq)
@@ -53,6 +61,53 @@ void print_progress(uint64_t total_received, uint64_t &next_print)
         next_print += PRINT_INTERVAL;
     }
 }
+
+
+bool store_pending_packet(std::vector<PendingPacket> &pending, uint32_t seq, const char *payload, uint32_t length) {
+    size_t index = seq % RING_SIZE;
+    PendingPacket &slot = pending[index];
+
+    if (slot.valid && slot.seq != seq) {
+        return false; // ring collision
+    }
+
+    if (!slot.valid) {
+        slot.valid = true;
+        slot.seq = seq;
+        slot.length = length;
+        std::memcpy(slot.payload, payload, length);
+    }
+
+    return true;
+}
+
+void flush_pending_packets(std::vector<PendingPacket> &pending,
+                           std::ofstream &out,
+                           uint32_t &expected_seq,
+                           uint64_t &total_received,
+                           uint64_t &data_packet_written,
+                           uint64_t &next_print)
+{
+    while (true)
+    {
+        size_t index = expected_seq % RING_SIZE;
+        PendingPacket &slot = pending[index];
+
+        if (!slot.valid || slot.seq != expected_seq)
+        {
+            break;
+        }
+
+        out.write(slot.payload, slot.length);
+        total_received += slot.length;
+        data_packet_written++;
+        print_progress(total_received, next_print);
+
+        slot.valid = false;
+        expected_seq++;
+    }
+}
+
 
 int main(int argc, char *argv[])
 {
@@ -120,6 +175,7 @@ int main(int argc, char *argv[])
     std::cout << "server listening on port " << port << "\n";
 
     std::vector<char> buffer(sizeof(PacketHeader) + max_chunk_size);
+    std::vector<PendingPacket> pending(RING_SIZE);
 
     uint32_t expected_seq = 0;
     uint64_t total_received = 0;
@@ -134,7 +190,7 @@ int main(int argc, char *argv[])
     uint64_t fin_received = 0;
     // ----
 
-    std::map<uint32_t, std::vector<char>> pending;
+    //std::map<uint32_t, std::vector<char>> pending;
 
     while (true)
     {
@@ -179,24 +235,13 @@ int main(int argc, char *argv[])
                 print_progress(total_received, next_print);
                 expected_seq++;
 
-                while (pending.count(expected_seq))
-                {
-                    auto &data = pending[expected_seq];
-                    out.write(data.data(), data.size());
-                    total_received += data.size();
-                    data_packet_written++;
-                    print_progress(total_received, next_print);
-                    pending.erase(expected_seq);
-                    expected_seq++;
-                }
+                flush_pending_packets(pending, out, expected_seq, total_received, data_packet_written, next_print);
             }
             else
             {
                 out_of_order_received++;
-                if (!pending.count(header.seq))
-                {
-                    pending[header.seq] =
-                        std::vector<char>(payload, payload + header.length);
+                if (!store_pending_packet(pending, header.seq, payload, header.length)) {
+                    std::cerr << "ring buffer collision at seq=" << header.seq << "\n";
                 }
             }
 
@@ -259,7 +304,7 @@ int main(int argc, char *argv[])
     std::cout << "out-of-order packets received: " << out_of_order_received << "\n";
     std::cout << "ACK packets sent: " << ack_sent << "\n";
     std::cout << "FIN packets received: " << fin_received << "\n";
-    std::cout << "pending packets left: " << pending.size() << "\n";
+    //std::cout << "pending packets left: " << pending.size() << "\n";
 
     return 0;
 }
