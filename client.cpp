@@ -239,10 +239,13 @@ int main(int argc, char *argv[])
             window.push_back(pkt);
             total_sent += bytes_read;
             pkt_count++;
+            
             if (pkt_count % 4 == 0)
             {
                 usleep(200); // 平均每包 50us，保持高吞吐同时避免突发冲垮 tbf
             }
+            
+            
             if (total_sent >= next_print)
             {
                 std::cout << "sent " << (total_sent / (1024 * 1024)) << " MB\n";
@@ -301,9 +304,10 @@ int main(int argc, char *argv[])
                         size_t sack_index = ack.sack_seq - base_seq;
                         window[sack_index].acked = true;
 
+                        int retransmit_limit = 2;
                         // fast retransmit
                         auto now = std::chrono::steady_clock::now();
-                        for (size_t i = 0; i < sack_index; ++i)
+                        for (size_t i = 0; i < sack_index && retransmit_limit > 0; ++i)
                         {
                             auto &pkt = window[i];
                             if (!pkt.acked)
@@ -315,6 +319,7 @@ int main(int argc, char *argv[])
                                     send_data_packet(sockfd, server_addr, pkt);
                                     pkt.last_sent = now;
                                     data_packet_resent++;
+                                    retransmit_limit--;
                                 }
                             }
                         }
