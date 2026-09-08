@@ -24,15 +24,17 @@ enum PacketType
 struct PacketHeader
 {
     uint32_t type;
-    uint32_t seq;
+    uint32_t seq;      // cumulative ack. meaning all packets before seq are received
+    uint32_t sack_seq; // selective ack
     uint32_t length;
 };
 
-void send_ack(int sockfd, sockaddr_in &client_addr, socklen_t client_len, uint32_t seq)
+void send_ack(int sockfd, sockaddr_in &client_addr, socklen_t client_len, uint32_t cum_ack, uint32_t sack_seq)
 {
     PacketHeader ack{};
     ack.type = ACK;
-    ack.seq = seq;
+    ack.seq = cum_ack;
+    ack.sack_seq = sack_seq;
     ack.length = 0;
 
     sendto(sockfd, &ack, sizeof(ack), 0,
@@ -157,13 +159,15 @@ int main(int argc, char *argv[])
             data_packet_received++;
             char *payload = buffer.data() + sizeof(PacketHeader);
 
-            send_ack(sockfd, client_addr, client_len, header.seq);
-            
-            ack_sent++;
+            // send_ack(sockfd, client_addr, client_len, header.seq);
+
+            // ack_sent++;
 
             if (header.seq < expected_seq)
             {
                 duplicate_packet_received++;
+                send_ack(sockfd, client_addr, client_len, expected_seq, header.seq);
+                ack_sent++;
                 continue;
             }
 
@@ -195,11 +199,14 @@ int main(int argc, char *argv[])
                         std::vector<char>(payload, payload + header.length);
                 }
             }
+
+            send_ack(sockfd, client_addr, client_len, expected_seq, header.seq);
+            ack_sent++;
         }
         else if (header.type == FIN)
         {
             fin_received++;
-            send_ack(sockfd, client_addr, client_len, header.seq);
+            send_ack(sockfd, client_addr, client_len, header.seq, header.seq);
             std::cout << "received FIN\n";
 
             timeval timeout{};
@@ -231,7 +238,7 @@ int main(int argc, char *argv[])
 
                 if (repeat_header.type == FIN && repeat_header.seq == header.seq)
                 {
-                    send_ack(sockfd, repeat_client, repeat_len, repeat_header.seq);
+                    send_ack(sockfd, repeat_client, repeat_len, repeat_header.seq, repeat_header.seq);
                     std::cout << "re-ACK duplicate FIN\n";
                 }
             }

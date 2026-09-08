@@ -29,6 +29,7 @@ struct PacketHeader
 {
     uint32_t type;
     uint32_t seq;
+    uint32_t sack_seq;
     uint32_t length;
 };
 
@@ -62,6 +63,7 @@ bool send_fin_wait_ack(int sockfd, sockaddr_in &server_addr, uint32_t fin_seq, u
     PacketHeader fin{};
     fin.type = FIN;
     fin.seq = fin_seq;
+    fin.sack_seq = fin_seq;
     fin.length = 0;
 
     while (true)
@@ -276,34 +278,44 @@ int main(int argc, char *argv[])
             {
                 break; // 缓冲区已空，跳出
             }
-
             if (n >= static_cast<ssize_t>(sizeof(PacketHeader)) && ack.type == ACK)
             {
                 ack_received++;
-                if (!window.empty() &&
-                    ack.seq >= window.front().header.seq &&
-                    ack.seq <= window.back().header.seq)
+                if (!window.empty())
                 {
-                    size_t index = ack.seq - window.front().header.seq;
-                    window[index].acked = true;
 
-                    // 快速重传：直接扫描 0 到 index-1 之间被跳过的未确认包
-                    auto now = std::chrono::steady_clock::now();
-                    for (size_t i = 0; i < index; ++i)
+                    uint32_t base_seq = window.front().header.seq;
+                    // ack cumulative
+                    if (ack.seq > base_seq)
                     {
-                        auto &pkt = window[i];
-                        if (!pkt.acked)
+                        size_t cum_count = std::min(static_cast<size_t>(ack.seq - base_seq), window.size());
+                        for (size_t i = 0; i < cum_count; ++i)
                         {
-                            auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-                                                  now - pkt.last_sent)
-                                                  .count();
+                            window[i].acked = true;
+                        }
+                    }
 
-                            // 80ms 冷却时间保护，触发快速重传
-                            if (elapsed_ms > 80)
+                    // ack selective
+                    if (ack.sack_seq >= base_seq && ack.sack_seq <= window.back().header.seq)
+                    {
+                        size_t sack_index = ack.sack_seq - base_seq;
+                        window[sack_index].acked = true;
+
+                        // fast retransmit
+                        auto now = std::chrono::steady_clock::now();
+                        for (size_t i = 0; i < sack_index; ++i)
+                        {
+                            auto &pkt = window[i];
+                            if (!pkt.acked)
                             {
-                                send_data_packet(sockfd, server_addr, pkt);
-                                pkt.last_sent = now;
-                                data_packet_resent++;
+                                auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(now - pkt.last_sent).count();
+
+                                if (elapsed_ms > 100)
+                                {
+                                    send_data_packet(sockfd, server_addr, pkt);
+                                    pkt.last_sent = now;
+                                    data_packet_resent++;
+                                }
                             }
                         }
                     }
