@@ -16,6 +16,7 @@ const int DEFAULT_CHUNK_SIZE = 1400;
 const int DEFAULT_WINDOW_SIZE = 128;
 const int DEFAULT_TIMEOUT_MS = 50;
 
+const size_t RING_SIZE = 16384;
 const uint64_t PRINT_INTERVAL = 10ULL * 1024 * 1024;
 
 enum PacketType
@@ -37,23 +38,21 @@ struct PacketHeader
 struct PacketState
 {
     PacketHeader header;
-    std::vector<char> payload;
+    char payload[DEFAULT_CHUNK_SIZE];
     bool acked;
     std::chrono::steady_clock::time_point last_sent;
 };
 
 void send_data_packet(int sockfd, sockaddr_in &server_addr, PacketState &pkt)
 {
-    std::vector<char> buffer(sizeof(PacketHeader) + pkt.header.length);
+    char buffer[sizeof(PacketHeader) + 1400];
 
-    std::memcpy(buffer.data(), &pkt.header, sizeof(PacketHeader));
-    std::memcpy(buffer.data() + sizeof(PacketHeader),
-                pkt.payload.data(),
-                pkt.header.length);
+    std::memcpy(buffer, &pkt.header, sizeof(PacketHeader));
+    std::memcpy(buffer + sizeof(PacketHeader), pkt.payload, pkt.header.length);
 
     sendto(sockfd,
-           buffer.data(),
-           buffer.size(),
+           buffer,
+           sizeof(PacketHeader) + pkt.header.length,
            0,
            reinterpret_cast<sockaddr *>(&server_addr),
            sizeof(server_addr));
@@ -189,10 +188,17 @@ int main(int argc, char *argv[])
         return 1;
     }
 
-    std::deque<PacketState> window;
-    uint32_t next_seq = 0;
+    // 设置内核 4MB 缓冲区
+    int buf_size = 4 * 1024 * 1024;
+    setsockopt(sockfd, SOL_SOCKET, SO_SNDBUF, &buf_size, sizeof(buf_size));
+    setsockopt(sockfd, SOL_SOCKET, SO_RCVBUF, &buf_size, sizeof(buf_size));
+
+    std::vector<PacketState> window(RING_SIZE);
+    uint32_t base_seq = 0; // 窗口队头 seq
+    uint32_t next_seq = 0; // 下一个发包 seq
     uint64_t total_sent = 0;
     bool file_done = false;
+
     uint64_t next_print = PRINT_INTERVAL;
 
     // ———— Statistics
@@ -207,14 +213,14 @@ int main(int argc, char *argv[])
 
     auto start_time = std::chrono::steady_clock::now();
 
-    while (!file_done || !window.empty())
+    while (!file_done || base_seq < next_seq)
     {
-        // send files until window full
-        while (!file_done && window.size() < static_cast<size_t>(window_size))
+        // 填充滑动窗口
+        while (!file_done && (next_seq - base_seq) < static_cast<uint32_t>(window_size))
         {
-            std::vector<char> payload(chunk_size);
+            auto &pkt = window[next_seq % RING_SIZE];
 
-            in.read(payload.data(), chunk_size);
+            in.read(pkt.payload, chunk_size);
             std::streamsize bytes_read = in.gcount();
 
             if (bytes_read <= 0)
@@ -223,29 +229,21 @@ int main(int argc, char *argv[])
                 break;
             }
 
-            payload.resize(bytes_read);
-
-            PacketHeader header{};
-            header.type = DATA;
-            header.seq = next_seq;
-            header.length = bytes_read;
-
-            PacketState pkt{};
-            pkt.header = header;
-            pkt.payload = payload;
+            pkt.header.type = DATA;
+            pkt.header.seq = next_seq;
+            pkt.header.length = bytes_read;
             pkt.acked = false;
 
             send_data_packet(sockfd, server_addr, pkt);
             pkt.last_sent = std::chrono::steady_clock::now();
             data_packet_sent++;
 
-            window.push_back(pkt);
             total_sent += bytes_read;
             pkt_count++;
 
             if (pkt_count % 4 == 0)
             {
-                usleep(200); // 平均每包 50us，保持高吞吐同时避免突发冲垮 tbf
+                usleep(400);
             }
 
             if (total_sent >= next_print)
@@ -257,24 +255,6 @@ int main(int argc, char *argv[])
             next_seq++;
         }
 
-        /*
-        PacketHeader ack{};
-        ssize_t n = recvfrom(sockfd, &ack, sizeof(ack), 0, nullptr, nullptr);
-
-        if (n >= static_cast<ssize_t>(sizeof(PacketHeader)) && ack.type == ACK)
-        {
-            ack_received++;
-
-            for (auto &pkt : window)
-            {
-                if (pkt.header.seq == ack.seq)
-                {
-                    pkt.acked = true;
-                    break;
-                }
-            }
-        }
-        */
         PacketHeader ack{};
         while (true)
         {
@@ -286,32 +266,27 @@ int main(int argc, char *argv[])
             if (n >= static_cast<ssize_t>(sizeof(PacketHeader)) && ack.type == ACK)
             {
                 ack_received++;
-                if (!window.empty())
+                if (base_seq < next_seq)
                 {
-
-                    uint32_t base_seq = window.front().header.seq;
-                    // ack cumulative
-                    if (ack.seq > base_seq)
+                    // 累计 ACK 确认
+                    if (ack.seq > base_seq && ack.seq <= next_seq)
                     {
-                        size_t cum_count = std::min(static_cast<size_t>(ack.seq - base_seq), window.size());
-                        for (size_t i = 0; i < cum_count; ++i)
+                        for (uint32_t s = base_seq; s < ack.seq; ++s)
                         {
-                            window[i].acked = true;
+                            window[s % RING_SIZE].acked = true;
                         }
                     }
 
-                    // ack selective
-                    if (ack.sack_seq >= base_seq && ack.sack_seq <= window.back().header.seq)
+                    // 选择性 ACK (SACK) 处理
+                    if (ack.sack_seq >= base_seq && ack.sack_seq < next_seq)
                     {
-                        size_t sack_index = ack.sack_seq - base_seq;
-                        window[sack_index].acked = true;
+                        window[ack.sack_seq % RING_SIZE].acked = true;
 
                         int retransmit_limit = 2;
-                        // fast retransmit
                         auto now = std::chrono::steady_clock::now();
-                        for (size_t i = 0; i < sack_index && retransmit_limit > 0; ++i)
+                        for (uint32_t s = base_seq; s < ack.sack_seq && retransmit_limit > 0; ++s)
                         {
-                            auto &pkt = window[i];
+                            auto &pkt = window[s % RING_SIZE];
                             if (!pkt.acked)
                             {
                                 auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(now - pkt.last_sent).count();
@@ -330,36 +305,19 @@ int main(int argc, char *argv[])
             }
         }
 
-        while (!window.empty() && window.front().acked)
+        // 推动队头，滑动窗口（替代 pop_front）
+        while (base_seq < next_seq && window[base_seq % RING_SIZE].acked)
         {
-            window.pop_front();
+            base_seq++;
         }
 
-        // fast retransmit
-
-        // resend 能不能只检查window的一半？
-        /*
-        auto now = std::chrono::steady_clock::now();
-        for (auto &pkt : window)
-        {
-            auto elapsed = std::chrono::duration_cast<std::chrono::microseconds>(now - pkt.last_sent).count();
-
-            if (!pkt.acked && elapsed > timeout_ms * 1000)
-            {
-                send_data_packet(sockfd, server_addr, pkt);
-                pkt.last_sent = now;
-                data_packet_resent++;
-                timeout_count++;
-
-                usleep(100);
-            }
-        }
-        */
-        if (!window.empty())
+        // RTO 超时检测遍历
+        if (base_seq < next_seq)
         {
             auto now = std::chrono::steady_clock::now();
-            for (auto &pkt : window)
+            for (uint32_t s = base_seq; s < next_seq; ++s)
             {
+                auto &pkt = window[s % RING_SIZE];
                 if (pkt.acked)
                     continue;
 
@@ -376,7 +334,6 @@ int main(int argc, char *argv[])
                 }
                 else if (elapsed_ms < timeout_ms / 2)
                 {
-                    // 后续数据包刚发送不久，不可能超时，直接提前终止遍历
                     break;
                 }
             }
