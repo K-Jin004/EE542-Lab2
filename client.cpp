@@ -193,8 +193,9 @@ int main(int argc, char *argv[])
     // ———— Statistics
     uint64_t data_packet_sent = 0;   // 第一次发送 DATA 的数量
     uint64_t data_packet_resent = 0; // 重发 DATA 的数量
+    uint64_t data_packet_fast_resent = 0;
     uint64_t ack_received = 0;       // 收到 ACK 的数量
-    uint64_t timeout_count = 0;      // timeout 导致重发的次数
+    uint64_t timeout_resent = 0;      // timeout 导致重发的次数
     uint64_t fin_sent = 0;           // FIN 发送次数
 
     static int pkt_count = 0;
@@ -288,6 +289,7 @@ int main(int argc, char *argv[])
                                 {
                                     send_data_packet(sockfd, server_addr, pkt);
                                     pkt.last_sent = now;
+                                    data_packet_fast_resent++;
                                     data_packet_resent++;
                                     retransmit_limit--;
                                 }
@@ -323,7 +325,7 @@ int main(int argc, char *argv[])
                     send_data_packet(sockfd, server_addr, pkt);
                     pkt.last_sent = now;
                     data_packet_resent++;
-                    timeout_count++;
+                    timeout_resent++;
                 }
                 /*
                 else if (elapsed_ms < timeout_ms / 2)
@@ -356,8 +358,10 @@ int main(int argc, char *argv[])
 
     std::cout << "data packets sent: " << data_packet_sent << "\n";
     std::cout << "data packets resent: " << data_packet_resent << "\n";
+    std::cout << "data packets fast retransmit resent: " << data_packet_fast_resent << "\n";
+    std::cout << "timeout resent: " << timeout_resent << "\n";
     std::cout << "acks received: " << ack_received << "\n";
-    std::cout << "timeouts: " << timeout_count << "\n";
+    
     std::cout << "FIN packets sent: " << fin_sent << "\n";
 
     return 0;
