@@ -40,6 +40,7 @@ struct PacketState
     PacketHeader header;
     char payload[DEFAULT_CHUNK_SIZE];
     bool acked;
+    uint8_t miss_count;
     std::chrono::steady_clock::time_point last_sent;
 };
 
@@ -51,12 +52,11 @@ void send_data_packet(int sockfd, sockaddr_in &server_addr, PacketState &pkt)
     std::memcpy(buffer + sizeof(PacketHeader), pkt.payload, pkt.header.length);
 
     sendto(sockfd,
-                        buffer,
-                        sizeof(PacketHeader) + pkt.header.length,
-                        0,
-                        reinterpret_cast<sockaddr *>(&server_addr),
-                        sizeof(server_addr));
-
+           buffer,
+           sizeof(PacketHeader) + pkt.header.length,
+           0,
+           reinterpret_cast<sockaddr *>(&server_addr),
+           sizeof(server_addr));
 }
 
 bool send_fin_wait_ack(int sockfd, sockaddr_in &server_addr, uint32_t fin_seq, uint64_t &fin_sent)
@@ -194,9 +194,9 @@ int main(int argc, char *argv[])
     uint64_t data_packet_sent = 0;   // 第一次发送 DATA 的数量
     uint64_t data_packet_resent = 0; // 重发 DATA 的数量
     uint64_t data_packet_fast_resent = 0;
-    uint64_t ack_received = 0;       // 收到 ACK 的数量
-    uint64_t timeout_resent = 0;      // timeout 导致重发的次数
-    uint64_t fin_sent = 0;           // FIN 发送次数
+    uint64_t ack_received = 0;   // 收到 ACK 的数量
+    uint64_t timeout_resent = 0; // timeout 导致重发的次数
+    uint64_t fin_sent = 0;       // FIN 发送次数
 
     static int pkt_count = 0;
     //---
@@ -223,13 +223,12 @@ int main(int argc, char *argv[])
             pkt.header.seq = next_seq;
             pkt.header.length = bytes_read;
             pkt.acked = false;
+            pkt.miss_count = 0;
 
             send_data_packet(sockfd, server_addr, pkt);
-            
+
             pkt.last_sent = std::chrono::steady_clock::now();
             data_packet_sent++;
-            
-            
 
             total_sent += bytes_read;
             pkt_count++;
@@ -266,14 +265,18 @@ int main(int argc, char *argv[])
                     {
                         for (uint32_t s = base_seq; s < ack.seq; ++s)
                         {
-                            window[s % RING_SIZE].acked = true;
+                            auto &pkt = window[s % RING_SIZE];
+                            pkt.acked = true;
+                            pkt.miss_count = 0;
                         }
                     }
 
                     // 选择性 ACK (SACK) 处理
                     if (ack.sack_seq >= base_seq && ack.sack_seq < next_seq)
                     {
-                        window[ack.sack_seq % RING_SIZE].acked = true;
+                        auto &sack_pkt = window[ack.sack_seq % RING_SIZE];
+                        sack_pkt.acked = true;
+                        sack_pkt.miss_count = 0;
 
                         // fast retransmit
                         int retransmit_limit = 2;
@@ -281,18 +284,22 @@ int main(int argc, char *argv[])
                         for (uint32_t s = base_seq; s < ack.sack_seq && retransmit_limit > 0; ++s)
                         {
                             auto &pkt = window[s % RING_SIZE];
-                            if (!pkt.acked)
-                            {
-                                auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(now - pkt.last_sent).count();
 
-                                if (elapsed_ms > 200)
-                                {
-                                    send_data_packet(sockfd, server_addr, pkt);
-                                    pkt.last_sent = now;
-                                    data_packet_fast_resent++;
-                                    data_packet_resent++;
-                                    retransmit_limit--;
-                                }
+                            if (pkt.acked)
+                            {
+                                continue;
+                            }
+
+                            pkt.miss_count++;
+                            auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(now - pkt.last_sent).count();
+
+                            if (pkt.miss_count >= 3 && elapsed_ms > 150)
+                            {
+                                send_data_packet(sockfd, server_addr, pkt);
+                                pkt.last_sent = now;
+                                data_packet_fast_resent++;
+                                data_packet_resent++;
+                                retransmit_limit--;
                             }
                         }
                     }
@@ -323,6 +330,7 @@ int main(int argc, char *argv[])
                 if (elapsed_ms > timeout_ms)
                 {
                     send_data_packet(sockfd, server_addr, pkt);
+                    pkt.miss_count = 0;
                     pkt.last_sent = now;
                     data_packet_resent++;
                     timeout_resent++;
@@ -333,7 +341,6 @@ int main(int argc, char *argv[])
                     break;
                 }
                 */
-                
             }
         }
     }
@@ -361,7 +368,7 @@ int main(int argc, char *argv[])
     std::cout << "data packets fast retransmit resent: " << data_packet_fast_resent << "\n";
     std::cout << "timeout resent: " << timeout_resent << "\n";
     std::cout << "acks received: " << ack_received << "\n";
-    
+
     std::cout << "FIN packets sent: " << fin_sent << "\n";
 
     return 0;
