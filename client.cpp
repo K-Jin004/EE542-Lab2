@@ -22,7 +22,8 @@ enum PacketType
 {
     DATA = 1,
     ACK = 2,
-    FIN = 3
+    FIN = 3,
+    FIN_ACK = 4
 };
 
 struct PacketHeader
@@ -78,7 +79,9 @@ bool send_fin_wait_ack(int sockfd, sockaddr_in &server_addr, uint32_t fin_seq, u
             PacketHeader ack{};
             ssize_t n = recvfrom(sockfd, &ack, sizeof(ack), 0, nullptr, nullptr);
 
-            if (n >= static_cast<ssize_t>(sizeof(PacketHeader)) && ack.type == ACK && ack.seq == fin_seq)
+            if (n >= static_cast<ssize_t>(sizeof(PacketHeader)) &&
+                ack.type == FIN_ACK &&
+                ack.seq == fin_seq)
             {
                 std::cout << "FIN acknowledged\n";
                 return true;
@@ -239,13 +242,12 @@ int main(int argc, char *argv[])
             window.push_back(pkt);
             total_sent += bytes_read;
             pkt_count++;
-            
+
             if (pkt_count % 4 == 0)
             {
                 usleep(200); // 平均每包 50us，保持高吞吐同时避免突发冲垮 tbf
             }
-            
-            
+
             if (total_sent >= next_print)
             {
                 std::cout << "sent " << (total_sent / (1024 * 1024)) << " MB\n";
