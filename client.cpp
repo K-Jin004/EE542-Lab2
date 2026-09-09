@@ -51,11 +51,12 @@ void send_data_packet(int sockfd, sockaddr_in &server_addr, PacketState &pkt)
     std::memcpy(buffer + sizeof(PacketHeader), pkt.payload, pkt.header.length);
 
     sendto(sockfd,
-           buffer,
-           sizeof(PacketHeader) + pkt.header.length,
-           0,
-           reinterpret_cast<sockaddr *>(&server_addr),
-           sizeof(server_addr));
+                        buffer,
+                        sizeof(PacketHeader) + pkt.header.length,
+                        0,
+                        reinterpret_cast<sockaddr *>(&server_addr),
+                        sizeof(server_addr));
+
 }
 
 bool send_fin_wait_ack(int sockfd, sockaddr_in &server_addr, uint32_t fin_seq, uint64_t &fin_sent)
@@ -76,7 +77,7 @@ bool send_fin_wait_ack(int sockfd, sockaddr_in &server_addr, uint32_t fin_seq, u
         while (true)
         {
             PacketHeader ack{};
-            ssize_t n = recvfrom(sockfd, &ack, sizeof(ack), 0, nullptr, nullptr);
+            ssize_t n = recvfrom(sockfd, &ack, sizeof(ack), MSG_DONTWAIT, nullptr, nullptr);
 
             if (n >= static_cast<ssize_t>(sizeof(PacketHeader)) &&
                 ack.type == FIN_ACK &&
@@ -99,7 +100,6 @@ bool send_fin_wait_ack(int sockfd, sockaddr_in &server_addr, uint32_t fin_seq, u
         }
     }
 }
-
 
 int main(int argc, char *argv[])
 {
@@ -145,7 +145,6 @@ int main(int argc, char *argv[])
         return 1;
     }
 
-
     // 替换为：设置为非阻塞模式 nonblocking
     /*
     int flags = fcntl(sockfd, F_GETFL, 0);
@@ -156,7 +155,6 @@ int main(int argc, char *argv[])
         return 1;
     }
     */
-    
 
     //
 
@@ -226,8 +224,11 @@ int main(int argc, char *argv[])
             pkt.acked = false;
 
             send_data_packet(sockfd, server_addr, pkt);
+            
             pkt.last_sent = std::chrono::steady_clock::now();
             data_packet_sent++;
+            
+            
 
             total_sent += bytes_read;
             pkt_count++;
@@ -273,6 +274,7 @@ int main(int argc, char *argv[])
                     {
                         window[ack.sack_seq % RING_SIZE].acked = true;
 
+                        // fast retransmit
                         int retransmit_limit = 2;
                         auto now = std::chrono::steady_clock::now();
                         for (uint32_t s = base_seq; s < ack.sack_seq && retransmit_limit > 0; ++s)
@@ -282,7 +284,7 @@ int main(int argc, char *argv[])
                             {
                                 auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(now - pkt.last_sent).count();
 
-                                if (elapsed_ms > 100)
+                                if (elapsed_ms > 200)
                                 {
                                     send_data_packet(sockfd, server_addr, pkt);
                                     pkt.last_sent = now;
@@ -323,10 +325,13 @@ int main(int argc, char *argv[])
                     data_packet_resent++;
                     timeout_count++;
                 }
+                /*
                 else if (elapsed_ms < timeout_ms / 2)
                 {
                     break;
                 }
+                */
+                
             }
         }
     }
