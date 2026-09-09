@@ -100,6 +100,7 @@ bool send_fin_wait_ack(int sockfd, sockaddr_in &server_addr, uint32_t fin_seq, u
     }
 }
 
+
 int main(int argc, char *argv[])
 {
     if (argc < 4 || argc > 7)
@@ -144,21 +145,9 @@ int main(int argc, char *argv[])
         return 1;
     }
 
-    // setting time out
-
-    /*
-    timeval timeout{};
-    timeout.tv_sec = timeout_ms / 1000;
-    timeout.tv_usec = (timeout_ms % 1000) * 1000;
-    if (setsockopt(sockfd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)) < 0)
-    {
-        perror("setsockopt");
-        close(sockfd);
-        return 1;
-    }
-    */
 
     // 替换为：设置为非阻塞模式 nonblocking
+    /*
     int flags = fcntl(sockfd, F_GETFL, 0);
     if (fcntl(sockfd, F_SETFL, flags | O_NONBLOCK) < 0)
     {
@@ -166,6 +155,8 @@ int main(int argc, char *argv[])
         close(sockfd);
         return 1;
     }
+    */
+    
 
     //
 
@@ -258,7 +249,7 @@ int main(int argc, char *argv[])
         PacketHeader ack{};
         while (true)
         {
-            ssize_t n = recvfrom(sockfd, &ack, sizeof(ack), 0, nullptr, nullptr);
+            ssize_t n = recvfrom(sockfd, &ack, sizeof(ack), MSG_DONTWAIT, nullptr, nullptr);
             if (n <= 0)
             {
                 break; // 缓冲区已空，跳出
