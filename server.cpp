@@ -8,8 +8,11 @@
 #include <cstring>
 #include <fstream>
 #include <iostream>
-#include <map>
 #include <vector>
+#include <thread>
+#include <mutex>
+#include <condition_variable>
+#include <queue>
 
 const int CHUNK_SIZE = 1400;
 const uint64_t PRINT_INTERVAL = 10ULL * 1024 * 1024;
@@ -19,7 +22,8 @@ enum PacketType
 {
     DATA = 1,
     ACK = 2,
-    FIN = 3
+    FIN = 3,
+    FIN_ACK = 4 // Added so the client can exit its while loop easily
 };
 
 struct PacketHeader
@@ -33,14 +37,19 @@ struct PacketHeader
 struct PendingPacket {
     bool valid = false;
     uint32_t length = 0;
-    uint32_t seq;
-    char payload[CHUNK_SIZE];
+    uint32_t seq = 0;
+    std::vector<char> payload;
 };
 
-void send_ack(int sockfd, sockaddr_in &client_addr, socklen_t client_len, uint32_t cum_ack, uint32_t sack_seq)
+std::mutex mtx;
+std::condition_variable cv;
+std::queue<std::vector<char>> write_queue;
+bool transfer_complete = false;
+
+void send_ack(int sockfd, sockaddr_in &client_addr, socklen_t client_len, uint32_t cum_ack, uint32_t sack_seq, uint32_t type = ACK)
 {
     PacketHeader ack{};
-    ack.type = ACK;
+    ack.type = type;
     ack.seq = cum_ack;
     ack.sack_seq = sack_seq;
     ack.length = 0;
@@ -50,43 +59,75 @@ void send_ack(int sockfd, sockaddr_in &client_addr, socklen_t client_len, uint32
            client_len);
 }
 
-void print_progress(uint64_t total_received, uint64_t &next_print)
+// Background Thread: to writing data to the disk
+void disk_worker(const char* output_file)
 {
-    while (total_received >= next_print)
+    std::ofstream out(output_file, std::ios::binary);
+    if (!out)
     {
-        std::cout << "received "
-                  << (next_print / (1024 * 1024))
-                  << " MB\n";
-
-        next_print += PRINT_INTERVAL;
+        std::cerr << "Disk Thread: cannot open output file\n";
+        return;
     }
-}
 
+    uint64_t total_written = 0;
+    uint64_t next_print = PRINT_INTERVAL;
+
+    while (true)
+    {
+        std::vector<char> data_chunk;
+        
+        {
+            std::unique_lock<std::mutex> lock(mtx);
+            // Wait until there is data in the queue OR the transfer is marked complete
+            cv.wait(lock, [] { return !write_queue.empty() || transfer_complete; });
+            
+            if (write_queue.empty() && transfer_complete) {
+                break;
+            }
+            
+            // Pop the data chunk off the queue
+            data_chunk = std::move(write_queue.front());
+            write_queue.pop();
+        }
+        
+        // Write to disk
+        out.write(data_chunk.data(), data_chunk.size());
+        total_written += data_chunk.size();
+        
+        // Print progress
+        while (total_written >= next_print)
+        {
+            std::cout << "wrote " << (next_print / (1024 * 1024)) << " MB to disk\n";
+            next_print += PRINT_INTERVAL;
+        }
+    }
+
+    out.close();
+    std::cout << "Disk Thread: finished writing file.\n";
+}
 
 bool store_pending_packet(std::vector<PendingPacket> &pending, uint32_t seq, const char *payload, uint32_t length) {
     size_t index = seq % RING_SIZE;
     PendingPacket &slot = pending[index];
 
     if (slot.valid && slot.seq != seq) {
-        return false; // ring collision
+        return false;
     }
 
     if (!slot.valid) {
         slot.valid = true;
         slot.seq = seq;
         slot.length = length;
-        std::memcpy(slot.payload, payload, length);
+        std::memcpy(slot.payload.data(), payload, length); // Safe because payload is pre-allocated
     }
 
     return true;
 }
 
 void flush_pending_packets(std::vector<PendingPacket> &pending,
-                           std::ofstream &out,
                            uint32_t &expected_seq,
                            uint64_t &total_received,
-                           uint64_t &data_packet_written,
-                           uint64_t &next_print)
+                           uint64_t &data_packet_written)
 {
     while (true)
     {
@@ -98,16 +139,21 @@ void flush_pending_packets(std::vector<PendingPacket> &pending,
             break;
         }
 
-        out.write(slot.payload, slot.length);
+        // Push valid out-of-order packet to the disk queue
+        std::vector<char> data(slot.payload.begin(), slot.payload.begin() + slot.length);
+        {
+            std::lock_guard<std::mutex> lock(mtx);
+            write_queue.push(std::move(data));
+        }
+        cv.notify_one();
+
         total_received += slot.length;
         data_packet_written++;
-        print_progress(total_received, next_print);
 
         slot.valid = false;
         expected_seq++;
     }
 }
-
 
 int main(int argc, char *argv[])
 {
@@ -154,15 +200,7 @@ int main(int argc, char *argv[])
         return 1;
     }
 
-    std::ofstream out(output_file, std::ios::binary);
-    if (!out)
-    {
-        std::cerr << "cannot open output file\n";
-        close(sockfd);
-        return 1;
-    }
-
-    int buf_size = 4 * 1024 * 1024; // 4MB
+    int buf_size = 4 * 1024 * 1024;
     if (setsockopt(sockfd, SOL_SOCKET, SO_RCVBUF, &buf_size, sizeof(buf_size)) < 0)
     {
         perror("setsockopt SO_RCVBUF");
@@ -174,24 +212,30 @@ int main(int argc, char *argv[])
 
     std::cout << "server listening on port " << port << "\n";
 
+    // Start the Disk Writer Consumer Thread
+    std::thread writer_thread(disk_worker, output_file);
+
     std::vector<char> buffer(sizeof(PacketHeader) + max_chunk_size);
+    
+    // Initialize Pending Packets with pre-allocated vectors for MTU safety
     std::vector<PendingPacket> pending(RING_SIZE);
+    for(auto& p : pending) {
+        p.payload.resize(max_chunk_size);
+    }
 
     uint32_t expected_seq = 0;
     uint64_t total_received = 0;
-    uint64_t next_print = PRINT_INTERVAL;
 
     // ---- statistics
-    uint64_t data_packet_received = 0;      // 收到 DATA 包总数，包括重复
-    uint64_t data_packet_written = 0;       // 真正写入文件的 DATA 包数
-    uint64_t duplicate_packet_received = 0; // seq < expected_seq
-    uint64_t out_of_order_received = 0;     // seq > expected_seq
+    uint64_t data_packet_received = 0;          // 收到 DATA 包总数，包括重复
+    uint64_t data_packet_written = 0;           // 真正写入文件的 DATA 包数
+    uint64_t duplicate_packet_received = 0;     // seq < expected_seq
+    uint64_t out_of_order_received = 0;         // seq > expected_seq
     uint64_t ack_sent = 0;
     uint64_t fin_received = 0;
     // ----
 
-    //std::map<uint32_t, std::vector<char>> pending;
-
+    // Producer Loop: Network Thread
     while (true)
     {
         sockaddr_in client_addr{};
@@ -215,10 +259,6 @@ int main(int argc, char *argv[])
             data_packet_received++;
             char *payload = buffer.data() + sizeof(PacketHeader);
 
-            // send_ack(sockfd, client_addr, client_len, header.seq);
-
-            // ack_sent++;
-
             if (header.seq < expected_seq)
             {
                 duplicate_packet_received++;
@@ -229,13 +269,19 @@ int main(int argc, char *argv[])
 
             if (header.seq == expected_seq)
             {
-                out.write(payload, header.length);
+                // Send directly to the queue
+                std::vector<char> data(payload, payload + header.length);
+                {
+                    std::lock_guard<std::mutex> lock(mtx);
+                    write_queue.push(std::move(data));
+                }
+                cv.notify_one(); // Wake up the disk thread
+                
                 total_received += header.length;
                 data_packet_written++;
-                print_progress(total_received, next_print);
                 expected_seq++;
 
-                flush_pending_packets(pending, out, expected_seq, total_received, data_packet_written, next_print);
+                flush_pending_packets(pending, expected_seq, total_received, data_packet_written);
             }
             else
             {
@@ -251,7 +297,8 @@ int main(int argc, char *argv[])
         else if (header.type == FIN)
         {
             fin_received++;
-            send_ack(sockfd, client_addr, client_len, header.seq, header.seq);
+            // Send FIN_ACK so the client knows it can safely exit
+            send_ack(sockfd, client_addr, client_len, header.seq, header.seq, FIN_ACK);
             std::cout << "received FIN\n";
 
             timeval timeout{};
@@ -259,6 +306,7 @@ int main(int argc, char *argv[])
             timeout.tv_usec = 0;
             setsockopt(sockfd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
 
+            // Wait for any duplicate FINs in case our FIN_ACK dropped
             while (true)
             {
                 sockaddr_in repeat_client{};
@@ -270,7 +318,7 @@ int main(int argc, char *argv[])
 
                 if (n < 0)
                 {
-                    break; // 2 seconds passed, no more duplicate FIN
+                    break; 
                 }
 
                 if (n < static_cast<ssize_t>(sizeof(PacketHeader)))
@@ -283,28 +331,33 @@ int main(int argc, char *argv[])
 
                 if (repeat_header.type == FIN && repeat_header.seq == header.seq)
                 {
-                    send_ack(sockfd, repeat_client, repeat_len, repeat_header.seq, repeat_header.seq);
+                    send_ack(sockfd, repeat_client, repeat_len, repeat_header.seq, repeat_header.seq, FIN_ACK);
                     std::cout << "re-ACK duplicate FIN\n";
                 }
             }
 
-            break;
+            break; // Break the main receiving loop
         }
     }
 
-    out.close();
+    {
+        std::lock_guard<std::mutex> lock(mtx);
+        transfer_complete = true;
+    }
+    cv.notify_all();
+
+    writer_thread.join();
+
     std::cout << "saved file: " << output_file << "\n";
-
     close(sockfd);
+    
     std::cout << "total received: " << total_received << " bytes\n";
-
     std::cout << "data packets received: " << data_packet_received << "\n";
-    std::cout << "data packets written: " << data_packet_written << "\n";
+    std::cout << "data packets written (queued): " << data_packet_written << "\n";
     std::cout << "duplicate packets received: " << duplicate_packet_received << "\n";
     std::cout << "out-of-order packets received: " << out_of_order_received << "\n";
     std::cout << "ACK packets sent: " << ack_sent << "\n";
     std::cout << "FIN packets received: " << fin_received << "\n";
-    //std::cout << "pending packets left: " << pending.size() << "\n";
 
     return 0;
 }
