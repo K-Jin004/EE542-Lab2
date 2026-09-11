@@ -9,17 +9,19 @@
 #include <chrono>
 #include "common.h"
 
-int main(int argc, char* argv[]) {
-    if (argc < 2) {
+int main(int argc, char *argv[])
+{
+    if (argc < 2)
+    {
         std::cout << "Usage: ./client <filepath>\n";
         return 1;
-
     }
 
     std::string filepath = argv[1];
 
     std::ifstream file(filepath, std::ios::binary | std::ios::ate);
-    if (!file.is_open()) {
+    if (!file.is_open())
+    {
         std::cerr << "Failed to open file: " << filepath << "\n";
         return 1;
     }
@@ -53,26 +55,26 @@ int main(int argc, char* argv[]) {
     start_hdr.file_size = file_size;
     start_hdr.payload_len = 0;
 
-    //time record
+    // time record
     auto send_start = std::chrono::steady_clock::now();
     //---
 
     // 连续发送 3 次 START 包防止丢包
-    for (int i = 0; i < 5; ++i) {
-        sendto(sockfd, &start_hdr, sizeof(start_hdr), 0, 
-               (sockaddr*)&server_addr, sizeof(server_addr));
+    for (int i = 0; i < 5; ++i)
+    {
+        sendto(sockfd, &start_hdr, sizeof(start_hdr), 0,
+               (sockaddr *)&server_addr, sizeof(server_addr));
     }
 
-
     std::cout << "[Client] START packet sent to " << SERVER_IP << ":" << SERVER_PORT << "\n";
-
 
     // 4. 按顺序发送 DATA 包 (Step 2 核心)
     std::vector<char> packet_buf(sizeof(PacketHeader) + PAYLOAD_SIZE);
 
-    for (uint32_t seq = 0; seq < total_packets; ++seq) {
+    for (uint32_t seq = 0; seq < total_packets; ++seq)
+    {
         // 填header
-        PacketHeader* hdr = reinterpret_cast<PacketHeader*>(packet_buf.data());
+        PacketHeader *hdr = reinterpret_cast<PacketHeader *>(packet_buf.data());
         hdr->type = PKT_DATA;
         hdr->seq = seq;
         hdr->total_packets = total_packets;
@@ -86,18 +88,35 @@ int main(int argc, char* argv[]) {
         memcpy(packet_buf.data() + sizeof(PacketHeader), file_buffer.data() + offset, current_len);
 
         sendto(sockfd, packet_buf.data(), sizeof(PacketHeader) + current_len, 0,
-               (sockaddr*)&server_addr, sizeof(server_addr));
+               (sockaddr *)&server_addr, sizeof(server_addr));
 
         // 简单的控速以防本地 Socket 缓冲区瞬间塞满丢包
-        if (seq % 10 == 0) usleep(100);
-    
-
+        if (seq % 10 == 0)
+            usleep(800);
     }
 
     std::cout << "[Client] All DATA packets sent.\n";
 
-    auto send_end = std::chrono::steady_clock::now();
+    PacketHeader fin_hdr{PKT_FIN, 0, total_packets, file_size, 0};
+    for (int i = 0; i < 5; ++i)
+    {
+        sendto(sockfd, &fin_hdr, sizeof(fin_hdr), 0, (sockaddr *)&server_addr, sizeof(server_addr));
+    }
 
+    std::cout << "[Client] PKT_FIN sent. Waiting for Server FIN confirmation...\n";
+
+    PacketHeader ack_hdr{};
+    while (true)
+    {
+        ssize_t bytes = recvfrom(sockfd, &ack_hdr, sizeof(ack_hdr), 0, nullptr, nullptr);
+        if (bytes >= (ssize_t)sizeof(PacketHeader) && ack_hdr.type == PKT_FIN)
+        {
+            std::cout << "[Client] Server confirmed PKT_FIN. Transfer complete!\n";
+            break;
+        }
+    }
+
+    auto send_end = std::chrono::steady_clock::now();
 
     // Print statistics
     double send_sec = std::chrono::duration<double>(send_end - send_start).count();
