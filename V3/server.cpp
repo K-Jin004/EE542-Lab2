@@ -148,6 +148,7 @@ int main(int argc, char *argv[])
 
                 const size_t max_seqs_per_pkt = PAYLOAD_SIZE / sizeof(uint32_t);
                 std::vector<char> nack_pkt_buf(sizeof(PacketHeader) + PAYLOAD_SIZE);
+                uint32_t sent_nack_pkts = 0;
 
                 for (int redundancy = 0; redundancy < 3; ++redundancy)
                 {
@@ -167,6 +168,11 @@ int main(int argc, char *argv[])
 
                         sendto(sockfd, nack_pkt_buf.data(), sizeof(PacketHeader) + payload_bytes, 0,
                                (sockaddr *)&client_addr, addr_len);
+
+                        sent_nack_pkts++;
+                        if (sent_nack_pkts %10 == 0) {
+                            usleep(1000);
+                        }
                     }
                 }
 

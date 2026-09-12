@@ -138,7 +138,7 @@ int main(int argc, char *argv[])
             // 精准控速 (100Mbps)
             if (i % 10 == 0)
             {
-                usleep(1200);
+                usleep(1000);
             }
         }
 
