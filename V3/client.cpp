@@ -83,7 +83,7 @@ int main(int argc, char *argv[])
     std::vector<char> ack_buf(sizeof(PacketHeader) + PAYLOAD_SIZE);
 
     bool transfer_complete = false;
-    int round = 1;
+    uint32_t current_round = 1;
 
     while (!transfer_complete)
     {
@@ -120,6 +120,7 @@ int main(int argc, char *argv[])
             hdr->seq = seq;
             hdr->total_packets = total_packets;
             hdr->file_size = file_size;
+            hdr->round = current_round;
 
             uint64_t offset = (uint64_t)seq * PAYLOAD_SIZE;
             uint16_t current_len = std::min((uint64_t)PAYLOAD_SIZE, file_size - offset);
@@ -141,10 +142,10 @@ int main(int argc, char *argv[])
             }
         }
 
-        std::cout << "[Client] Round " << round << " DATA sent. Sending PKT_FIN and waiting for feedback...\n";
+        std::cout << "[Client] Round " << current_round << " DATA sent: " << queue_size << " packets " << "Sending PKT_FIN and waiting for feedback...\n";
 
         // 2. 发送本轮结束标记 PKT_FIN (重复 5 次)
-        PacketHeader fin_hdr{PKT_FIN, 0, total_packets, file_size, 0};
+        PacketHeader fin_hdr{PKT_FIN, 0, total_packets, file_size, 0, current_round};
         for (int i = 0; i < 5; ++i)
         {
             sendto(sockfd, &fin_hdr, sizeof(fin_hdr), 0, (sockaddr *)&server_addr, sizeof(server_addr));
@@ -208,16 +209,18 @@ int main(int argc, char *argv[])
                         next_round_seqs.push_back(missing_seq);
                     }
                 }
-            }
+            } 
         }
 
         if (transfer_complete)
             break;
 
         packets_to_send = std::move(next_round_seqs);
-        std::cout << "[Client] Round " << round << " ended. Retransmitting "
+        std::cout << "[Client] Round " << current_round << " ended. Retransmitting "
                   << packets_to_send.size() << " missing packets in next round.\n";
-        round++;
+
+        std::cout << "======================================\n";
+        current_round++;
     }
 
     auto send_end = std::chrono::steady_clock::now();

@@ -23,5 +23,6 @@ struct PacketHeader {
     uint32_t total_packets; // 总包数
     uint64_t file_size;     // 文件总大小 (字节)
     uint16_t payload_len;   // 负载长度
+    uint32_t round;
 };
 #pragma pack(pop)

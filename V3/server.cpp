@@ -44,6 +44,7 @@ int main(int argc, char *argv[])
     uint64_t file_size = 0;
     uint32_t received_packets = 0;
     bool initialized = false;
+    uint32_t last_round = 0;
 
     sockaddr_in client_addr{};
     socklen_t addr_len = sizeof(client_addr);
@@ -99,7 +100,14 @@ int main(int argc, char *argv[])
         }
         else if (hdr->type == PKT_FIN && initialized)
         {
-            std::cout << "[Server] Received PKT_FIN from Client.\n";
+            
+
+            // skip duplicate FIN
+            if (hdr->round <= last_round) {
+                continue;
+            }
+
+            std::cout << "[Server] Received PKT_FIN from Client for Round " << hdr->round << "\n";
 
             // 检测数据是否 100% 完整
             if (received_packets == total_packets)
@@ -122,6 +130,8 @@ int main(int argc, char *argv[])
             }
             else
             {
+                last_round = hdr->round;
+
                 std::cout << "[Server] Client sent FIN, but missing "
                           << (total_packets - received_packets) << " packets.\n";
                 
@@ -162,6 +172,7 @@ int main(int argc, char *argv[])
 
                 std::cout << "[Server] Sent " << missing_seqs.size() 
                           << " missing seqs in NACK packets (3x redundancy).\n";
+                std::cout << "======================================\n";
             }
         }
     }
