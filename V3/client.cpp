@@ -9,7 +9,78 @@
 #include <chrono>
 #include <cerrno>
 #include <algorithm>
+#include <thread>
+#include <atomic>
 #include "common.h"
+
+// 设置发送并发线程数
+constexpr int NUM_TX_THREADS = 4;
+
+void tx_worker_thread(int sockfd, const sockaddr_in &server_addr,
+                      const std::vector<char> &file_buffer, uint64_t file_size,
+                      uint32_t total_packets, uint32_t current_round,
+                      const std::vector<uint32_t> &packets_to_send,
+                      std::atomic<size_t> &global_idx)
+{
+    size_t queue_size = packets_to_send.size();
+    std::vector<char> packet_buf(sizeof(PacketHeader) + PAYLOAD_SIZE);
+
+    while (true)
+    {
+        // 无锁竞争获取下一个要发送的包索引
+        size_t i = global_idx.fetch_add(1, std::memory_order_relaxed);
+        if (i >= queue_size)
+            break;
+
+        // 动态喷发控制 (计算剩余包数量)
+        size_t remaining = queue_size - i;
+        int dup_sends = 1;
+        if (remaining <= 400)
+        {
+            dup_sends = 4;
+        }
+        else if (remaining <= 850)
+        {
+            dup_sends = 3;
+        }
+        else if (remaining <= 1700)
+        {
+            dup_sends = 2;
+        }
+        else
+        {
+            dup_sends = 1;
+        }
+
+        uint32_t seq = packets_to_send[i];
+
+        PacketHeader *hdr = reinterpret_cast<PacketHeader *>(packet_buf.data());
+        hdr->type = PKT_DATA;
+        hdr->seq = seq;
+        hdr->total_packets = total_packets;
+        hdr->file_size = file_size;
+        hdr->round = current_round;
+
+        uint64_t offset = (uint64_t)seq * PAYLOAD_SIZE;
+        uint16_t current_len = std::min((uint64_t)PAYLOAD_SIZE, file_size - offset);
+        hdr->payload_len = current_len;
+
+        memcpy(packet_buf.data() + sizeof(PacketHeader), file_buffer.data() + offset, current_len);
+
+        // 并行 sendto 发送数据
+        for (int dup = 0; dup < dup_sends; ++dup)
+        {
+            sendto(sockfd, packet_buf.data(), sizeof(PacketHeader) + current_len, 0,
+                   (sockaddr *)&server_addr, sizeof(server_addr));
+        }
+
+        // 控速 (多线程平摊 Pacing 步长)
+        if (i % (10 * NUM_TX_THREADS) == 0)
+        {
+            usleep(800);
+        }
+    }
+}
 
 int main(int argc, char *argv[])
 {
@@ -43,8 +114,8 @@ int main(int argc, char *argv[])
     server_addr.sin_port = htons(SERVER_PORT);
     inet_pton(AF_INET, SERVER_IP, &server_addr.sin_addr);
 
-    // 设置内核 4MB 缓冲区
-    int buf_size = 4 * 1024 * 1024;
+    // 设置内核 8MB 缓冲区以匹配并发高吞吐
+    int buf_size = 8 * 1024 * 1024;
     setsockopt(sockfd, SOL_SOCKET, SO_SNDBUF, &buf_size, sizeof(buf_size));
     setsockopt(sockfd, SOL_SOCKET, SO_RCVBUF, &buf_size, sizeof(buf_size));
 
@@ -79,7 +150,6 @@ int main(int argc, char *argv[])
         packets_to_send[i] = i;
     }
 
-    std::vector<char> packet_buf(sizeof(PacketHeader) + PAYLOAD_SIZE);
     std::vector<char> ack_buf(sizeof(PacketHeader) + PAYLOAD_SIZE);
 
     bool transfer_complete = false;
@@ -89,69 +159,44 @@ int main(int argc, char *argv[])
     {
         size_t queue_size = packets_to_send.size();
 
-        // 1. 发送当前轮次队列中的所有数据包
-        for (size_t i = 0; i < queue_size; ++i)
+        // 1. 创建 NUM_TX_THREADS 个并发发送线程，通过 atomic 索引无锁协同发送
+        std::atomic<size_t> global_tx_idx{0};
+        std::vector<std::thread> tx_threads;
+        tx_threads.reserve(NUM_TX_THREADS);
+
+        for (int t = 0; t < NUM_TX_THREADS; ++t)
         {
-            // 【实时计算】：当前轮次还剩下多少个包没有发送
-            size_t remaining = queue_size - i;
-
-            int dup_sends = 1;
-            if (remaining <= 400)
-            {
-                dup_sends = 4; // 最后 400 包：4x 喷发，保送首轮/本轮直接收尾
-            }
-            else if (remaining <= 850)
-            {
-                dup_sends = 3;
-            }
-            else if (remaining <= 1700)
-            {
-                dup_sends = 2; // 进入 BDP 管道容量范围，开始 2x 填充
-            }
-            else
-            {
-                dup_sends = 1; // 管道处于满载状态，正常 1x 发送
-            }
-
-            uint32_t seq = packets_to_send[i];
-
-            PacketHeader *hdr = reinterpret_cast<PacketHeader *>(packet_buf.data());
-            hdr->type = PKT_DATA;
-            hdr->seq = seq;
-            hdr->total_packets = total_packets;
-            hdr->file_size = file_size;
-            hdr->round = current_round;
-
-            uint64_t offset = (uint64_t)seq * PAYLOAD_SIZE;
-            uint16_t current_len = std::min((uint64_t)PAYLOAD_SIZE, file_size - offset);
-            hdr->payload_len = current_len;
-
-            memcpy(packet_buf.data() + sizeof(PacketHeader), file_buffer.data() + offset, current_len);
-
-            // 执行 dynamic dup_sends 次连续喷发
-            for (int dup = 0; dup < dup_sends; ++dup)
-            {
-                sendto(sockfd, packet_buf.data(), sizeof(PacketHeader) + current_len, 0,
-                       (sockaddr *)&server_addr, sizeof(server_addr));
-            }
-
-            // 精准控速 (100Mbps)
-            if (i % 10 == 0)
-            {
-                usleep(1000);
-            }
+            tx_threads.emplace_back(tx_worker_thread, sockfd, std::ref(server_addr),
+                                    std::ref(file_buffer), file_size, total_packets,
+                                    current_round, std::ref(packets_to_send),
+                                    std::ref(global_tx_idx));
         }
 
-        std::cout << "[Client] Round " << current_round << " DATA sent: " << queue_size << " packets " << "Sending PKT_FIN and waiting for feedback...\n";
+        // 等待所有发送线程完成本轮的数据喷发
+        for (auto &t : tx_threads)
+        {
+            if (t.joinable())
+                t.join();
+        }
+
+        std::cout << "[Client] Round " << current_round << " DATA sent (" << NUM_TX_THREADS
+                  << " threads): " << queue_size << " packets. Sending PKT_FIN...\n";
 
         // 2. 发送本轮结束标记 PKT_FIN (重复 5 次)
-        PacketHeader fin_hdr{PKT_FIN, 0, total_packets, file_size, 0, current_round};
+        PacketHeader fin_hdr{};
+        fin_hdr.type = PKT_FIN;
+        fin_hdr.seq = 0;
+        fin_hdr.total_packets = total_packets;
+        fin_hdr.file_size = file_size;
+        fin_hdr.round = current_round;
+        fin_hdr.payload_len = 0;
+
         for (int i = 0; i < 5; ++i)
         {
             sendto(sockfd, &fin_hdr, sizeof(fin_hdr), 0, (sockaddr *)&server_addr, sizeof(server_addr));
         }
 
-        // 3. 阻塞收集 Server 端返回的反馈
+        // 3. 主线程阻塞接收 Server 端反馈 (NACK / FIN)
         std::vector<uint8_t> nack_mask(total_packets, 0);
         std::vector<uint8_t> received_nack_pkts(total_packets, 0);
 
@@ -201,7 +246,7 @@ int main(int argc, char *argv[])
                 got_response = true;
                 uint32_t nack_pkt_id = ack_hdr->seq;
 
-                // check duplicate nack
+                // 过滤重复的 NACK 包
                 if (nack_pkt_id < total_packets && received_nack_pkts[nack_pkt_id] == 1)
                 {
                     continue;

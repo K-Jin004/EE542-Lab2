@@ -128,7 +128,7 @@ void control_tx_thread_func(int send_fd, std::string output_path)
         lock.unlock();
 
         // 修复：改为 < 而不是 <=，允许 Client 在 NACK 丢失触发超时后，重新请求同一轮次的 NACK
-        if (round < last_processed_round)
+        if (round <= last_processed_round)
             continue;
         last_processed_round = round;
 
@@ -199,7 +199,7 @@ void control_tx_thread_func(int send_fd, std::string output_path)
                     sent_nack_pkts++;
                     if (sent_nack_pkts % 10 == 0)
                     {
-                        usleep(1000); // 速率控制，防止冲垮发送缓冲区
+                        usleep(800); // 速率控制，防止冲垮发送缓冲区
                     }
                 }
             }
@@ -256,7 +256,7 @@ int main(int argc, char *argv[])
     // 1. 创建 2 个 RX 接收线程，记录 socket 文件描述符
     std::vector<std::thread> rx_threads;
     std::vector<int> rx_fds;
-    for (int i = 0; i < 2; ++i)
+    for (int i = 0; i < 4; ++i)
     {
         int fd = create_reuseport_socket(SERVER_PORT);
         rx_fds.push_back(fd);
