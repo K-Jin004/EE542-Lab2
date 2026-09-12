@@ -153,6 +153,8 @@ int main(int argc, char *argv[])
 
         // 3. 阻塞收集 Server 端返回的反馈
         std::vector<uint8_t> nack_mask(total_packets, 0);
+        std::vector<uint8_t> received_nack_pkts(total_packets, 0);
+
         std::vector<uint32_t> next_round_seqs;
         bool got_response = false;
 
@@ -197,6 +199,19 @@ int main(int argc, char *argv[])
             else if (ack_hdr->type == PKT_NACK)
             {
                 got_response = true;
+                uint32_t nack_pkt_id = ack_hdr->seq;
+
+                // check duplicate nack
+                if (nack_pkt_id < total_packets && received_nack_pkts[nack_pkt_id] == 1)
+                {
+                    continue;
+                }
+
+                if (nack_pkt_id < total_packets)
+                {
+                    received_nack_pkts[nack_pkt_id] = 1;
+                }
+
                 uint32_t count = ack_hdr->payload_len / sizeof(uint32_t);
                 uint32_t *seqs = reinterpret_cast<uint32_t *>(ack_buf.data() + sizeof(PacketHeader));
 
@@ -209,7 +224,7 @@ int main(int argc, char *argv[])
                         next_round_seqs.push_back(missing_seq);
                     }
                 }
-            } 
+            }
         }
 
         if (transfer_complete)
