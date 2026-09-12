@@ -38,6 +38,8 @@ int main(int argc, char *argv[])
     std::vector<char> recv_buf(sizeof(PacketHeader) + PAYLOAD_SIZE);
     std::vector<char> file_buffer; // 接收文件的 DRAM 缓冲区
 
+    std::vector<uint8_t> received_map; // bitmap for ack
+
     uint32_t total_packets = 0;
     uint64_t file_size = 0;
     uint32_t received_packets = 0;
@@ -61,6 +63,7 @@ int main(int argc, char *argv[])
             total_packets = hdr->total_packets;
             file_size = hdr->file_size;
             file_buffer.resize(file_size);
+            received_map.assign(total_packets, 0);
             initialized = true;
 
             std::cout << "[Server] START received. Allocated " << file_size << " bytes in DRAM.\n";
@@ -72,21 +75,26 @@ int main(int argc, char *argv[])
             uint32_t seq = hdr->seq;
             uint64_t offset = (uint64_t)seq * PAYLOAD_SIZE;
 
-            // 将负载数据直接 memcpy 到 DRAM 缓冲区的正确偏移处
-            memcpy(file_buffer.data() + offset,
-                   recv_buf.data() + sizeof(PacketHeader),
-                   hdr->payload_len);
-
-            received_packets++;
-
-            if (received_packets % 10000 == 0 || received_packets == total_packets)
+            if (received_map[seq] == 0)
             {
-                std::cout << "[Server] Progress: " << received_packets << "/" << total_packets << " packets.\n";
-            }
+                
+                // 将负载数据直接 memcpy 到 DRAM 缓冲区的正确偏移处
+                memcpy(file_buffer.data() + offset,
+                       recv_buf.data() + sizeof(PacketHeader),
+                       hdr->payload_len);
 
-            if (received_packets == total_packets)
-            {
-                std::cout << "[Server] All packets received in DRAM!\n";
+                received_map[seq] = 1;
+                received_packets++;
+
+                if (received_packets % 10000 == 0 || received_packets == total_packets)
+                {
+                    std::cout << "[Server] Progress: " << received_packets << "/" << total_packets << " packets.\n";
+                }
+
+                if (received_packets == total_packets)
+                {
+                    std::cout << "[Server] All packets received in DRAM!\n";
+                }
             }
         }
         else if (hdr->type == PKT_FIN && initialized)
@@ -116,7 +124,44 @@ int main(int argc, char *argv[])
             {
                 std::cout << "[Server] Client sent FIN, but missing "
                           << (total_packets - received_packets) << " packets.\n";
-                // 后续 Step 4/5 在这里触发 NACK 重传
+                
+                //线性扫描 Bitmap 提取缺失序号
+                std::vector<uint32_t> missing_seqs;
+                missing_seqs.reserve(total_packets - received_packets);
+                for (uint32_t i = 0; i < total_packets; ++i)
+                {
+                    if (received_map[i] == 0)
+                    {
+                        missing_seqs.push_back(i);
+                    }
+                }
+
+                const size_t max_seqs_per_pkt = PAYLOAD_SIZE / sizeof(uint32_t);
+                std::vector<char> nack_pkt_buf(sizeof(PacketHeader) + PAYLOAD_SIZE);
+
+                for (int redundancy = 0; redundancy < 3; ++redundancy)
+                {
+                    for (size_t offset = 0; offset < missing_seqs.size(); offset += max_seqs_per_pkt)
+                    {
+                        uint32_t count = std::min((size_t)max_seqs_per_pkt, missing_seqs.size() - offset);
+                        uint32_t payload_bytes = count * sizeof(uint32_t);
+
+                        PacketHeader *nack_hdr = reinterpret_cast<PacketHeader *>(nack_pkt_buf.data());
+                        nack_hdr->type = PKT_NACK;
+                        nack_hdr->seq = offset / max_seqs_per_pkt; // 记载分包批次序号
+                        nack_hdr->payload_len = payload_bytes;
+
+                        memcpy(nack_pkt_buf.data() + sizeof(PacketHeader),
+                               &missing_seqs[offset],
+                               payload_bytes);
+
+                        sendto(sockfd, nack_pkt_buf.data(), sizeof(PacketHeader) + payload_bytes, 0,
+                               (sockaddr *)&client_addr, addr_len);
+                    }
+                }
+
+                std::cout << "[Server] Sent " << missing_seqs.size() 
+                          << " missing seqs in NACK packets (3x redundancy).\n";
             }
         }
     }
