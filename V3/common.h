@@ -2,7 +2,9 @@
 #include <cstdint>
 #include <cstddef>
 
-constexpr uint16_t SERVER_PORT = 8080;
+constexpr size_t NUM_RX_THREADS = 4;
+constexpr uint16_t SERVER_MAIN_PORT = 9000; // 控制/主端口 (START, FIN, NACK)
+constexpr uint16_t SERVER_BASE_PORT = 9001; // 接收数据工作端口基准 (8081, 8082, 8083, 8084)
 constexpr size_t PAYLOAD_SIZE = 1400;
 
 // 硬编码 VM 的固定 IP 地址
@@ -23,6 +25,6 @@ struct PacketHeader {
     uint32_t total_packets; // 总包数
     uint64_t file_size;     // 文件总大小 (字节)
     uint16_t payload_len;   // 负载长度
-    uint32_t round;
+    uint32_t round;         // 当前轮次
 };
 #pragma pack(pop)

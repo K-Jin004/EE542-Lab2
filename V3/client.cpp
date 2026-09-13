@@ -13,26 +13,47 @@
 #include <atomic>
 #include "common.h"
 
-// 设置发送并发线程数
-constexpr int NUM_TX_THREADS = 4;
+// 设置发送并发线程数（与 Server RX 线程数相匹配）
+constexpr int NUM_TX_THREADS = NUM_RX_THREADS;
 
-void tx_worker_thread(int sockfd, const sockaddr_in &server_addr,
+void tx_worker_thread(int thread_idx,
                       const std::vector<char> &file_buffer, uint64_t file_size,
                       uint32_t total_packets, uint32_t current_round,
                       const std::vector<uint32_t> &packets_to_send,
                       std::atomic<size_t> &global_idx)
 {
+    // 每个发送线程独立创建套接字
+    int worker_sockfd = socket(AF_INET, SOCK_DGRAM, 0);
+    if (worker_sockfd < 0)
+    {
+        perror("Worker socket creation failed");
+        return;
+    }
+
+    // 设置线程专属的内核 4MB 发送缓冲区
+    int buf_size = 4 * 1024 * 1024;
+    setsockopt(worker_sockfd, SOL_SOCKET, SO_SNDBUF, &buf_size, sizeof(buf_size));
+
+    // 计算对应的 Server 端数据接收端口 (8081, 8082, 8083, 8084)
+    uint16_t target_port = SERVER_BASE_PORT + thread_idx;
+    sockaddr_in server_data_addr{};
+    server_data_addr.sin_family = AF_INET;
+    server_data_addr.sin_port = htons(target_port);
+    inet_pton(AF_INET, SERVER_IP, &server_data_addr.sin_addr);
+
+
+
     size_t queue_size = packets_to_send.size();
     std::vector<char> packet_buf(sizeof(PacketHeader) + PAYLOAD_SIZE);
 
     while (true)
     {
-        // 无锁竞争获取下一个要发送的包索引
+        // 无锁原子竞争获取下一个待发送数据包索引
         size_t i = global_idx.fetch_add(1, std::memory_order_relaxed);
         if (i >= queue_size)
             break;
 
-        // 动态喷发控制 (计算剩余包数量)
+        // 动态尾部重发喷发控制
         size_t remaining = queue_size - i;
         int dup_sends = 1;
         if (remaining <= 400)
@@ -51,7 +72,6 @@ void tx_worker_thread(int sockfd, const sockaddr_in &server_addr,
         {
             dup_sends = 1;
         }
-
         uint32_t seq = packets_to_send[i];
 
         PacketHeader *hdr = reinterpret_cast<PacketHeader *>(packet_buf.data());
@@ -67,19 +87,21 @@ void tx_worker_thread(int sockfd, const sockaddr_in &server_addr,
 
         memcpy(packet_buf.data() + sizeof(PacketHeader), file_buffer.data() + offset, current_len);
 
-        // 并行 sendto 发送数据
+        // 使用本线程独立的 Socket 发送给 Server 对应的专有端口
         for (int dup = 0; dup < dup_sends; ++dup)
         {
-            sendto(sockfd, packet_buf.data(), sizeof(PacketHeader) + current_len, 0,
-                   (sockaddr *)&server_addr, sizeof(server_addr));
+            sendto(worker_sockfd, packet_buf.data(), sizeof(PacketHeader) + current_len, 0,
+                   (sockaddr *)&server_data_addr, sizeof(server_data_addr));
+            
+            usleep(350);
         }
 
-        // 控速 (多线程平摊 Pacing 步长)
-        if (i % (10 * NUM_TX_THREADS) == 0)
-        {
-            usleep(800);
-        }
+    
+        
+        
     }
+
+    close(worker_sockfd);
 }
 
 int main(int argc, char *argv[])
@@ -108,24 +130,25 @@ int main(int argc, char *argv[])
     uint32_t total_packets = (file_size + PAYLOAD_SIZE - 1) / PAYLOAD_SIZE;
     std::cout << "[Client] File loaded. Size: " << file_size << " bytes, Total Packets: " << total_packets << "\n";
 
-    int sockfd = socket(AF_INET, SOCK_DGRAM, 0);
-    sockaddr_in server_addr{};
-    server_addr.sin_family = AF_INET;
-    server_addr.sin_port = htons(SERVER_PORT);
-    inet_pton(AF_INET, SERVER_IP, &server_addr.sin_addr);
+    // 1. 创建控制套接字，对接 Server 的 SERVER_MAIN_PORT (8080)
+    int control_sockfd = socket(AF_INET, SOCK_DGRAM, 0);
+    sockaddr_in server_main_addr{};
+    server_main_addr.sin_family = AF_INET;
+    server_main_addr.sin_port = htons(SERVER_MAIN_PORT);
+    inet_pton(AF_INET, SERVER_IP, &server_main_addr.sin_addr);
 
-    // 设置内核 8MB 缓冲区以匹配并发高吞吐
-    int buf_size = 8 * 1024 * 1024;
-    setsockopt(sockfd, SOL_SOCKET, SO_SNDBUF, &buf_size, sizeof(buf_size));
-    setsockopt(sockfd, SOL_SOCKET, SO_RCVBUF, &buf_size, sizeof(buf_size));
+    // 设置控制 Socket 缓冲区
+    int buf_size = 4 * 1024 * 1024;
+    setsockopt(control_sockfd, SOL_SOCKET, SO_SNDBUF, &buf_size, sizeof(buf_size));
+    setsockopt(control_sockfd, SOL_SOCKET, SO_RCVBUF, &buf_size, sizeof(buf_size));
 
     // 设置 300ms 接收超时
     struct timeval tv;
     tv.tv_sec = 0;
     tv.tv_usec = 300000; // 300 ms
-    setsockopt(sockfd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    setsockopt(control_sockfd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
 
-    // 构造并连续发送 5 次 START 包
+    // 2. 向 Server 主端口发送 START 包 (重复 5 次)
     PacketHeader start_hdr{};
     start_hdr.type = PKT_START;
     start_hdr.seq = 0;
@@ -137,11 +160,11 @@ int main(int argc, char *argv[])
 
     for (int i = 0; i < 5; ++i)
     {
-        sendto(sockfd, &start_hdr, sizeof(start_hdr), 0,
-               (sockaddr *)&server_addr, sizeof(server_addr));
+        sendto(control_sockfd, &start_hdr, sizeof(start_hdr), 0,
+               (sockaddr *)&server_main_addr, sizeof(server_main_addr));
     }
 
-    std::cout << "[Client] START packet sent to " << SERVER_IP << ":" << SERVER_PORT << "\n";
+    std::cout << "[Client] START packet sent to control port " << SERVER_IP << ":" << SERVER_MAIN_PORT << "\n";
 
     // 首轮待发送队列为所有包 (0 ~ total_packets - 1)
     std::vector<uint32_t> packets_to_send(total_packets);
@@ -159,20 +182,20 @@ int main(int argc, char *argv[])
     {
         size_t queue_size = packets_to_send.size();
 
-        // 1. 创建 NUM_TX_THREADS 个并发发送线程，通过 atomic 索引无锁协同发送
+        // 3. 创建 NUM_TX_THREADS 个并发发送线程，每个线程拥有独立的 Socket 并对接独立的 Server 数据端口
         std::atomic<size_t> global_tx_idx{0};
         std::vector<std::thread> tx_threads;
         tx_threads.reserve(NUM_TX_THREADS);
 
         for (int t = 0; t < NUM_TX_THREADS; ++t)
         {
-            tx_threads.emplace_back(tx_worker_thread, sockfd, std::ref(server_addr),
+            tx_threads.emplace_back(tx_worker_thread, t,
                                     std::ref(file_buffer), file_size, total_packets,
                                     current_round, std::ref(packets_to_send),
                                     std::ref(global_tx_idx));
         }
 
-        // 等待所有发送线程完成本轮的数据喷发
+        // 等待本轮并发数据喷发结束
         for (auto &t : tx_threads)
         {
             if (t.joinable())
@@ -180,9 +203,9 @@ int main(int argc, char *argv[])
         }
 
         std::cout << "[Client] Round " << current_round << " DATA sent (" << NUM_TX_THREADS
-                  << " threads): " << queue_size << " packets. Sending PKT_FIN...\n";
+                  << " sockets): " << queue_size << " packets. Sending PKT_FIN to control port...\n";
 
-        // 2. 发送本轮结束标记 PKT_FIN (重复 5 次)
+        // 4. 向 Server 主端口发送本轮结束标记 PKT_FIN (重复 5 次)
         PacketHeader fin_hdr{};
         fin_hdr.type = PKT_FIN;
         fin_hdr.seq = 0;
@@ -193,10 +216,11 @@ int main(int argc, char *argv[])
 
         for (int i = 0; i < 5; ++i)
         {
-            sendto(sockfd, &fin_hdr, sizeof(fin_hdr), 0, (sockaddr *)&server_addr, sizeof(server_addr));
+            sendto(control_sockfd, &fin_hdr, sizeof(fin_hdr), 0,
+                   (sockaddr *)&server_main_addr, sizeof(server_main_addr));
         }
 
-        // 3. 主线程阻塞接收 Server 端反馈 (NACK / FIN)
+        // 5. 控制 Socket 阻塞接收 Server 控制线程反馈 (NACK / FIN)
         std::vector<uint8_t> nack_mask(total_packets, 0);
         std::vector<uint8_t> received_nack_pkts(total_packets, 0);
 
@@ -205,7 +229,7 @@ int main(int argc, char *argv[])
 
         while (true)
         {
-            ssize_t bytes = recvfrom(sockfd, ack_buf.data(), ack_buf.size(), 0, nullptr, nullptr);
+            ssize_t bytes = recvfrom(control_sockfd, ack_buf.data(), ack_buf.size(), 0, nullptr, nullptr);
 
             if (bytes < 0)
             {
@@ -222,7 +246,8 @@ int main(int argc, char *argv[])
                         std::cout << "[Client] Timeout. No response from server, re-sending PKT_FIN...\n";
                         for (int i = 0; i < 5; ++i)
                         {
-                            sendto(sockfd, &fin_hdr, sizeof(fin_hdr), 0, (sockaddr *)&server_addr, sizeof(server_addr));
+                            sendto(control_sockfd, &fin_hdr, sizeof(fin_hdr), 0,
+                                   (sockaddr *)&server_main_addr, sizeof(server_main_addr));
                         }
                         continue;
                     }
@@ -292,6 +317,6 @@ int main(int argc, char *argv[])
     std::cout << "Total transmission time: " << send_sec << " sec\n";
     std::cout << "Average transmission rate: " << send_rate_mbps << " Mbits/sec\n";
 
-    close(sockfd);
+    close(control_sockfd);
     return 0;
 }
